@@ -49,8 +49,13 @@ enum cs_opcode {
 	CS_OPCODE_MOVE48 = 1,
 	CS_OPCODE_MOVE32 = 2,
 	CS_OPCODE_WAIT = 3,
+	CS_OPCODE_ADD_IMM32 = 16,
+	CS_OPCODE_LOAD_MULTIPLE = 20,
 	CS_OPCODE_STM = 21,
+	CS_OPCODE_BRANCH = 22,
 	CS_OPCODE_FLUSH_CACHE = 36,
+	CS_OPCODE_SYNC_SET32 = 38,
+	CS_OPCODE_SYNC_WAIT32 = 39,
 };
 
 enum cs_flush_mode {
@@ -58,6 +63,12 @@ enum cs_flush_mode {
 	CS_FLUSH_MODE_CLEAN = 1,
 	CS_FLUSH_MODE_INVALIDATE = 2,
 	CS_FLUSH_MODE_CLEAN_AND_INVALIDATE = 3,
+};
+
+/* Condition codes for BRANCH and SYNC_WAIT operations. */
+enum cs_condition {
+	CS_CONDITION_GT = 1,
+	CS_CONDITION_EQ = 2,
 };
 
 /* There's no plan to support big endian in the UMD, so keep
@@ -113,6 +124,44 @@ struct cs_instr {
 			uint64_t unused2: 4;
 			uint64_t opcode: 8;
 		} flush;
+		struct {
+			uint64_t immediate: 32;
+			uint64_t unused0: 8;
+			uint64_t src: 8;
+			uint64_t dest: 8;
+			uint64_t opcode: 8;
+		} add_imm32;
+		struct {
+			uint64_t offset: 16;
+			uint64_t bitmap: 24;
+			uint64_t address: 8;
+			uint64_t sw: 8;
+			uint64_t opcode: 8;
+		} load_multiple;
+		struct {
+			uint64_t offset: 16;
+			uint64_t unused0: 12;
+			uint64_t condition: 4;
+			uint64_t unused1: 8;
+			uint64_t src: 8;
+			uint64_t unused2: 8;
+			uint64_t opcode: 8;
+		} branch;
+		struct {
+			uint64_t unused0: 32;
+			uint64_t val: 8;
+			uint64_t address: 8;
+			uint64_t unused1: 8;
+			uint64_t opcode: 8;
+		} sync_set32;
+		struct {
+			uint64_t unused0: 28;
+			uint64_t condition: 4;
+			uint64_t val: 8;
+			uint64_t address: 8;
+			uint64_t unused1: 8;
+			uint64_t opcode: 8;
+		} sync_wait32;
 		uint64_t raw;
 	};
 };
@@ -216,6 +265,81 @@ cs_flush(enum cs_flush_mode l2_mode,
 			.flush_id = flush_id,
 			.signal_slot = signal_slot,
 			.opcode = CS_OPCODE_FLUSH_CACHE,
+		},
+	};
+
+	return instr.raw;
+}
+
+static inline uint64_t
+cs_add_imm32(uint8_t dst, uint8_t src, uint32_t imm)
+{
+	struct cs_instr instr = {
+		.add_imm32 = {
+			.opcode = CS_OPCODE_ADD_IMM32,
+			.dest = dst,
+			.src = src,
+			.immediate = imm,
+		},
+	};
+
+	return instr.raw;
+}
+
+static inline uint64_t
+cs_load_multiple(uint8_t address, uint8_t sw, uint32_t bitmap, int16_t offset)
+{
+	struct cs_instr instr = {
+		.load_multiple = {
+			.opcode = CS_OPCODE_LOAD_MULTIPLE,
+			.sw = sw,
+			.address = address,
+			.bitmap = bitmap,
+			.offset = (uint16_t)offset,
+		},
+	};
+
+	return instr.raw;
+}
+
+static inline uint64_t
+cs_branch(uint8_t src, enum cs_condition condition, int16_t offset)
+{
+	struct cs_instr instr = {
+		.branch = {
+			.opcode = CS_OPCODE_BRANCH,
+			.src = src,
+			.condition = condition,
+			.offset = (uint16_t)offset,
+		},
+	};
+
+	return instr.raw;
+}
+
+static inline uint64_t
+cs_sync_set32(uint8_t address, uint8_t val)
+{
+	struct cs_instr instr = {
+		.sync_set32 = {
+			.opcode = CS_OPCODE_SYNC_SET32,
+			.address = address,
+			.val = val,
+		},
+	};
+
+	return instr.raw;
+}
+
+static inline uint64_t
+cs_sync_wait32(uint8_t address, uint8_t val, enum cs_condition condition)
+{
+	struct cs_instr instr = {
+		.sync_wait32 = {
+			.opcode = CS_OPCODE_SYNC_WAIT32,
+			.address = address,
+			.val = val,
+			.condition = condition,
 		},
 	};
 
