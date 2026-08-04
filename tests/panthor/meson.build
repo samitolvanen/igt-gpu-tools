@@ -5,6 +5,7 @@ panthor_progs = [
 	'panthor_pm',
 	'panthor_query',
 	'panthor_scheduler',
+	'panthor_sync',
 	'panthor_vm',
 ]
 
