@@ -2,6 +2,7 @@ panthor_progs = [
 	'panthor_devfreq',
 	'panthor_gem',
 	'panthor_group',
+	'panthor_heap',
 	'panthor_pm',
 	'panthor_query',
 	'panthor_scheduler',
