@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 // SPDX-FileCopyrightText: Copyright (C) 2026 Google LLC
 
+#include <fcntl.h>
 #include <stdint.h>
 #include <sys/mman.h>
 #include <time.h>
@@ -10,6 +11,7 @@
 #include "igt_panthor.h"
 #include "igt_syncobj.h"
 #include "panthor_drm.h"
+#include "sw_sync.h"
 
 /*
  * CSF scheduler functional tests for the Tyr/Panthor driver. Each subtest
@@ -18,10 +20,17 @@
  * commitment, idle prepopulation, normal and real-time priority preemption,
  * multi-queue groups, sync-wait blocking, job timeout, fatal faults, large
  * instruction streams, ring-buffer wrap, group destruction with active jobs,
- * and multi-queue dependency chains.
+ * multi-queue dependency chains, VM isolation across a fatal fault,
+ * unbinding a range an active job uses, and recovery after a job timeout.
  */
 
 #define INITIAL_VA	0x1000000
+
+/* Second mapping of the scratch BO, used to unbind data without code. */
+#define DATA_VA		0x1010000
+
+/* Where run_fresh_group() maps its own scratch BO. */
+#define FRESH_VA	0x1020000
 
 /* Byte offsets inside the per-group scratch BO. */
 #define STARTED_OFFSET	2056
@@ -165,6 +174,157 @@ static struct drm_panthor_sync_op wait_op(uint32_t syncobj)
 			 DRM_PANTHOR_SYNC_OP_WAIT,
 		.handle = syncobj,
 	};
+}
+
+/* Status of the fence a syncobj carries: 1 completed, negative on error. */
+static int fence_status(int fd, uint32_t syncobj)
+{
+	int fence, status;
+
+	fence = syncobj_handle_to_fd(fd, syncobj,
+				     DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_EXPORT_SYNC_FILE);
+	status = sync_fence_status(fence);
+	close(fence);
+
+	return status;
+}
+
+static uint32_t vm_state(int fd, uint32_t vm_id)
+{
+	struct drm_panthor_vm_get_state get_state = { .vm_id = vm_id };
+
+	do_ioctl(fd, DRM_IOCTL_PANTHOR_VM_GET_STATE, &get_state);
+
+	return get_state.state;
+}
+
+/* A group that faulted or timed out fails the can-run check with EINVAL. */
+static void assert_submit_rejected(int fd, uint32_t group_handle)
+{
+	struct drm_panthor_queue_submit submit = { .queue_index = 0 };
+	struct drm_panthor_group_submit group_submit = {
+		.group_handle = group_handle,
+		.queue_submits = DRM_PANTHOR_OBJ_ARRAY(1, &submit),
+	};
+
+	do_ioctl_err(fd, DRM_IOCTL_PANTHOR_GROUP_SUBMIT, &group_submit, EINVAL);
+}
+
+/*
+ * Create a group with one queue and run a counted loop on it. An empty
+ * stream would not do: the driver retires it from the previous fence without
+ * ever placing the group on a slot, so only a real stream shows that the
+ * firmware still runs work for this file descriptor.
+ */
+static void run_fresh_group(int fd, uint32_t vm_id)
+{
+	struct drm_panthor_queue_create queue = {
+		.priority = 0, .ringbuf_size = 4096,
+	};
+	struct drm_panthor_group_create cfg;
+	struct drm_panthor_sync_op sync;
+	volatile uint32_t *counter;
+	struct panthor_bo bo = {};
+	uint64_t instrs[16];
+	uint32_t syncobj;
+	int ninstrs;
+
+	igt_panthor_bo_create_mapped(fd, &bo, 4096, 0, 0);
+	counter = (volatile uint32_t *)((uint8_t *)bo.map + COUNTER_OFFSET);
+	*counter = 0;
+
+	ninstrs = emit_counted_loop(instrs, FRESH_VA + COUNTER_OFFSET, 0,
+				    COUNTED_LOOP_N);
+	memcpy(bo.map, instrs, ninstrs * sizeof(instrs[0]));
+
+	igt_panthor_vm_bind(fd, vm_id, bo.handle, FRESH_VA, bo.size,
+			    DRM_PANTHOR_VM_BIND_OP_TYPE_MAP |
+			    DRM_PANTHOR_VM_BIND_OP_MAP_UNCACHED, 0);
+
+	cfg = make_group_cfg(&queue, 1, PANTHOR_GROUP_PRIORITY_LOW, vm_id);
+	igt_panthor_group_create(fd, &cfg, 0);
+
+	syncobj = syncobj_create(fd, 0);
+	sync = signal_op(syncobj);
+	submit_stream(fd, cfg.group_handle, 0, FRESH_VA,
+		      ninstrs * sizeof(instrs[0]), &sync, 1);
+
+	igt_assert_f(wait_done(fd, syncobj, 10 * SEC_NS),
+		     "a fresh group timed out\n");
+	igt_assert_eq_u32(*counter, COUNTED_LOOP_N);
+
+	syncobj_destroy(fd, syncobj);
+	igt_panthor_group_destroy(fd, cfg.group_handle, 0);
+	igt_panthor_vm_bind(fd, vm_id, 0, FRESH_VA, bo.size,
+			    DRM_PANTHOR_VM_BIND_OP_TYPE_UNMAP, 0);
+	igt_panthor_free_bo(fd, &bo);
+}
+
+/*
+ * Kernel log markers for a GPU reset, for a firmware handshake that timed
+ * out, and for a job the scheduler had to kill. Only Tyr logs the reset
+ * itself, so elsewhere it is the timeout markers that show the same loss of
+ * progress, and the two drivers word those differently.
+ */
+static const char *const wedge_markers[] = {
+	"Starting GPU reset",
+	"FW ping timeout",
+	"update request timedout",
+	"firmware ack timeout",
+	"progress timeout",
+	"job timeout",
+	"Tyr queue job",
+	"Fast reset failed",
+	"Failed to boot MCU after reset",
+	NULL,
+};
+
+/*
+ * Open the kernel log positioned at its end, so that only what the subtest
+ * produces is read back. Reading it needs privileges the caller may not have.
+ */
+static int kmsg_open(void)
+{
+	int kmsg_fd = open("/dev/kmsg", O_RDONLY | O_NONBLOCK);
+
+	igt_require_f(kmsg_fd >= 0, "cannot read /dev/kmsg (errno %d)\n", errno);
+	lseek(kmsg_fd, 0, SEEK_END);
+
+	return kmsg_fd;
+}
+
+static void assert_no_wedge(int kmsg_fd)
+{
+	bool found = false;
+	char buf[4096];
+	ssize_t len;
+
+	for (;;) {
+		len = read(kmsg_fd, buf, sizeof(buf) - 1);
+		if (len <= 0) {
+			/*
+			 * A ring overrun and a record too long for the buffer
+			 * both consume the record and leave more to read.
+			 */
+			if (len < 0 && (errno == EPIPE || errno == EINVAL))
+				continue;
+			break;
+		}
+
+		buf[len] = '\0';
+
+		for (int i = 0; wedge_markers[i]; i++) {
+			if (strstr(buf, wedge_markers[i])) {
+				igt_warn("%s", buf);
+				found = true;
+			}
+		}
+	}
+
+	close(kmsg_fd);
+
+	igt_assert_f(!found,
+		     "the GPU was reset or lost a job during the subtest\n");
 }
 
 int igt_main()
@@ -332,6 +492,7 @@ int igt_main()
 	igt_describe("Overcommit CSG slots by one and verify time-slicing lets "
 		     "every counted-loop group start and complete.");
 	igt_subtest("csg_slots_overcommit") {
+		int kmsg_fd = kmsg_open();
 		uint32_t n = g_slots + 1;
 		uint32_t *vm_ids = calloc(n, sizeof(*vm_ids));
 		uint32_t *groups = calloc(n, sizeof(*groups));
@@ -406,6 +567,8 @@ int igt_main()
 		free(groups);
 		free(syncobjs);
 		free(bos);
+
+		assert_no_wedge(kmsg_fd);
 	}
 
 	igt_describe("Prepopulate every slot with idle (completed) groups, then "
@@ -740,6 +903,7 @@ int igt_main()
 	igt_describe("Overcommit CSG slots 2x with counted loops and verify "
 		     "extreme time-slicing still completes every group.");
 	igt_subtest("csg_slots_extreme_overcommit") {
+		int kmsg_fd = kmsg_open();
 		uint32_t n = g_slots * 2;
 		uint32_t *vm_ids = calloc(n, sizeof(*vm_ids));
 		uint32_t *groups = calloc(n, sizeof(*groups));
@@ -813,6 +977,8 @@ int igt_main()
 		free(groups);
 		free(syncobjs);
 		free(bos);
+
+		assert_no_wedge(kmsg_fd);
 	}
 
 	igt_describe("Fill every slot with busy high-priority counted loops, "
@@ -1198,6 +1364,232 @@ int igt_main()
 
 		syncobj_destroy(fd, syncobj);
 		igt_panthor_group_destroy(fd, group_handle, 0);
+		igt_panthor_free_bo(fd, &bo);
+		igt_panthor_vm_destroy(fd, vm_id, 0);
+	}
+
+	igt_describe("A group killed by a fatal fault stops taking work while "
+		     "its VM stays usable, and a second VM and group on the "
+		     "same file descriptor still run to completion.");
+	igt_subtest("fatal_fault_vm_isolation") {
+		uint32_t faulty_vm, faulty_group, good_vm, good_group, syncobj;
+		struct panthor_bo faulty_bo = {}, good_bo = {};
+		struct drm_panthor_queue_create queue = {
+			.priority = 0, .ringbuf_size = 4096,
+		};
+		struct drm_panthor_group_get_state get_state = {};
+		struct drm_panthor_group_create cfg;
+		struct drm_panthor_sync_op sync;
+		volatile uint32_t *counter;
+		/* Invalid opcode 0xff. */
+		uint64_t instr = (0xffULL << 56);
+		uint64_t instrs[16];
+		int ninstrs;
+
+		igt_panthor_vm_create(fd, &faulty_vm, 0);
+		igt_panthor_bo_create_mapped(fd, &faulty_bo, 4096, 0, 0);
+		memcpy(faulty_bo.map, &instr, sizeof(instr));
+		igt_panthor_vm_bind(fd, faulty_vm, faulty_bo.handle, INITIAL_VA,
+				    faulty_bo.size,
+				    DRM_PANTHOR_VM_BIND_OP_TYPE_MAP, 0);
+
+		cfg = make_group_cfg(&queue, 1, PANTHOR_GROUP_PRIORITY_LOW,
+				     faulty_vm);
+		igt_panthor_group_create(fd, &cfg, 0);
+		faulty_group = cfg.group_handle;
+
+		submit_stream(fd, faulty_group, 0, INITIAL_VA, sizeof(instr),
+			      NULL, 0);
+
+		/* GROUP_GET_STATE clears the handle, so set it every round. */
+		for (int i = 0; i < 500; i++) {
+			get_state = (struct drm_panthor_group_get_state){
+				.group_handle = faulty_group,
+			};
+			do_ioctl(fd, DRM_IOCTL_PANTHOR_GROUP_GET_STATE,
+				 &get_state);
+			if (get_state.state & DRM_PANTHOR_GROUP_STATE_FATAL_FAULT)
+				break;
+			usleep(10000);
+		}
+		igt_assert(get_state.state & DRM_PANTHOR_GROUP_STATE_FATAL_FAULT);
+		igt_assert_neq_u32(get_state.fatal_queues, 0);
+
+		/* A command stream fault does not invalidate the VM itself. */
+		igt_assert_eq_u32(vm_state(fd, faulty_vm),
+				  DRM_PANTHOR_VM_STATE_USABLE);
+
+		assert_submit_rejected(fd, faulty_group);
+
+		igt_panthor_vm_create(fd, &good_vm, 0);
+		igt_panthor_bo_create_mapped(fd, &good_bo, 4096, 0, 0);
+
+		counter = (volatile uint32_t *)((uint8_t *)good_bo.map +
+						COUNTER_OFFSET);
+		*counter = 0;
+
+		ninstrs = emit_counted_loop(instrs, INITIAL_VA + COUNTER_OFFSET,
+					    0, COUNTED_LOOP_N);
+		memcpy(good_bo.map, instrs, ninstrs * sizeof(instrs[0]));
+
+		igt_panthor_vm_bind(fd, good_vm, good_bo.handle, INITIAL_VA,
+				    good_bo.size,
+				    DRM_PANTHOR_VM_BIND_OP_TYPE_MAP |
+				    DRM_PANTHOR_VM_BIND_OP_MAP_UNCACHED, 0);
+
+		cfg = make_group_cfg(&queue, 1, PANTHOR_GROUP_PRIORITY_LOW,
+				     good_vm);
+		igt_panthor_group_create(fd, &cfg, 0);
+		good_group = cfg.group_handle;
+
+		syncobj = syncobj_create(fd, 0);
+		sync = signal_op(syncobj);
+		submit_stream(fd, good_group, 0, INITIAL_VA,
+			      ninstrs * sizeof(instrs[0]), &sync, 1);
+
+		igt_assert_f(wait_done(fd, syncobj, 10 * SEC_NS),
+			     "the unaffected group timed out\n");
+		igt_assert_eq_u32(*counter, COUNTED_LOOP_N);
+
+		syncobj_destroy(fd, syncobj);
+		igt_panthor_group_destroy(fd, good_group, 0);
+		igt_panthor_free_bo(fd, &good_bo);
+		igt_panthor_vm_destroy(fd, good_vm, 0);
+
+		igt_panthor_group_destroy(fd, faulty_group, 0);
+		igt_panthor_free_bo(fd, &faulty_bo);
+		igt_panthor_vm_destroy(fd, faulty_vm, 0);
+	}
+
+	igt_describe("Unbind a range a running counted loop writes to and "
+		     "verify the unbind is accepted, the job resolves either "
+		     "way, and the VM still takes new work.");
+	igt_subtest("unbind_active_range") {
+		uint32_t vm_id, group_handle, syncobj;
+		struct panthor_bo bo = {};
+		struct drm_panthor_queue_create queue = {
+			.priority = 0, .ringbuf_size = 4096,
+		};
+		struct drm_panthor_group_create cfg;
+		struct drm_panthor_sync_op sync;
+		volatile uint32_t *started;
+		uint64_t instrs[16];
+		int ninstrs, retries;
+
+		igt_panthor_vm_create(fd, &vm_id, 0);
+		syncobj = syncobj_create(fd, 0);
+		igt_panthor_bo_create_mapped(fd, &bo, 4096, 0, 0);
+
+		started = (volatile uint32_t *)((uint8_t *)bo.map + STARTED_OFFSET);
+		*started = 0;
+		*(volatile uint32_t *)((uint8_t *)bo.map + COUNTER_OFFSET) = 0;
+
+		/*
+		 * The loop runs from INITIAL_VA and writes through the second
+		 * mapping, so unbinding DATA_VA takes the data away while the
+		 * instructions stay mapped.
+		 */
+		ninstrs = emit_counted_loop(instrs, DATA_VA + COUNTER_OFFSET,
+					    DATA_VA + STARTED_OFFSET,
+					    COUNTED_LOOP_N);
+		memcpy(bo.map, instrs, ninstrs * sizeof(instrs[0]));
+
+		igt_panthor_vm_bind(fd, vm_id, bo.handle, INITIAL_VA, bo.size,
+				    DRM_PANTHOR_VM_BIND_OP_TYPE_MAP |
+				    DRM_PANTHOR_VM_BIND_OP_MAP_UNCACHED, 0);
+		igt_panthor_vm_bind(fd, vm_id, bo.handle, DATA_VA, bo.size,
+				    DRM_PANTHOR_VM_BIND_OP_TYPE_MAP |
+				    DRM_PANTHOR_VM_BIND_OP_MAP_UNCACHED, 0);
+
+		cfg = make_group_cfg(&queue, 1, PANTHOR_GROUP_PRIORITY_LOW, vm_id);
+		igt_panthor_group_create(fd, &cfg, 0);
+		group_handle = cfg.group_handle;
+
+		sync = signal_op(syncobj);
+		submit_stream(fd, group_handle, 0, INITIAL_VA,
+			      ninstrs * sizeof(instrs[0]), &sync, 1);
+
+		retries = 1000;
+		while (*started == 0 && retries--)
+			usleep(10000);
+		igt_assert_f(*started != 0, "the job failed to start\n");
+
+		igt_panthor_vm_bind(fd, vm_id, 0, DATA_VA, bo.size,
+				    DRM_PANTHOR_VM_BIND_OP_TYPE_UNMAP, 0);
+
+		/*
+		 * The loop either finishes or faults on the range that went
+		 * away. Both outcomes retire the fence.
+		 */
+		igt_assert_f(wait_done(fd, syncobj, 20 * SEC_NS),
+			     "the job never retired after the unbind\n");
+
+		igt_assert_eq_u32(vm_state(fd, vm_id),
+				  DRM_PANTHOR_VM_STATE_USABLE);
+
+		igt_panthor_group_destroy(fd, group_handle, 0);
+		run_fresh_group(fd, vm_id);
+
+		syncobj_destroy(fd, syncobj);
+		igt_panthor_free_bo(fd, &bo);
+		igt_panthor_vm_destroy(fd, vm_id, 0);
+	}
+
+	igt_describe("After the job timeout kills a group, the hung job's "
+		     "fence retires with an error, the group reports the "
+		     "timeout, and a fresh group runs straight away.");
+	igt_subtest("job_timeout_recovery") {
+		uint32_t vm_id, group_handle, syncobj;
+		struct panthor_bo bo = {};
+		struct drm_panthor_queue_create queue = {
+			.priority = 0, .ringbuf_size = 4096,
+		};
+		struct drm_panthor_group_get_state get_state = {};
+		struct drm_panthor_group_create cfg;
+		struct drm_panthor_sync_op sync;
+		volatile uint32_t *user_sync;
+		uint64_t instrs[3];
+		int status;
+
+		igt_panthor_vm_create(fd, &vm_id, 0);
+		igt_panthor_bo_create_mapped(fd, &bo, 4096, 0, 0);
+		igt_panthor_vm_bind(fd, vm_id, bo.handle, INITIAL_VA, bo.size,
+				    DRM_PANTHOR_VM_BIND_OP_TYPE_MAP, 0);
+
+		user_sync = (volatile uint32_t *)((uint8_t *)bo.map + USER_SYNC_OFFSET);
+		*user_sync = 0;
+
+		instrs[0] = cs_mov48(0, INITIAL_VA + USER_SYNC_OFFSET);
+		instrs[1] = cs_mov32(2, 0);
+		instrs[2] = cs_sync_wait32(0, 2, CS_CONDITION_GT);
+		memcpy(bo.map, instrs, sizeof(instrs));
+
+		cfg = make_group_cfg(&queue, 1, PANTHOR_GROUP_PRIORITY_LOW, vm_id);
+		igt_panthor_group_create(fd, &cfg, 0);
+		group_handle = cfg.group_handle;
+
+		syncobj = syncobj_create(fd, 0);
+		sync = signal_op(syncobj);
+		submit_stream(fd, group_handle, 0, INITIAL_VA, sizeof(instrs),
+			      &sync, 1);
+
+		/* Nothing releases the sync, so only the timeout can retire it. */
+		igt_assert_f(wait_done(fd, syncobj, 30 * SEC_NS),
+			     "the hung job's fence never retired\n");
+		status = fence_status(fd, syncobj);
+		igt_assert_f(status < 0, "the hung job reported status %d\n",
+			     status);
+
+		get_state.group_handle = group_handle;
+		do_ioctl(fd, DRM_IOCTL_PANTHOR_GROUP_GET_STATE, &get_state);
+		igt_assert(get_state.state & DRM_PANTHOR_GROUP_STATE_TIMEDOUT);
+
+		assert_submit_rejected(fd, group_handle);
+
+		igt_panthor_group_destroy(fd, group_handle, 0);
+		run_fresh_group(fd, vm_id);
+
+		syncobj_destroy(fd, syncobj);
 		igt_panthor_free_bo(fd, &bo);
 		igt_panthor_vm_destroy(fd, vm_id, 0);
 	}
