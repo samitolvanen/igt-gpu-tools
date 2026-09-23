@@ -12,7 +12,7 @@
 #include "panthor_drm.h"
 #include "sw_sync.h"
 
-#define PAGE_SIZE 4096ULL
+#define PAGE_SIZE ((uint64_t)getpagesize())
 
 /* A page-aligned GPU VA inside the user range, unlikely to collide. */
 #define TEST_VA 0x100000ULL

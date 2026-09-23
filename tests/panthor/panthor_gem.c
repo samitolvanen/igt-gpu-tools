@@ -123,7 +123,7 @@ int igt_main() {
 		struct panthor_bo bo;
 		uint64_t expected_size = getpagesize() * 2;
 
-		igt_panthor_bo_create(fd, &bo, 5000, 0, 0);
+		igt_panthor_bo_create(fd, &bo, getpagesize() + 904, 0, 0);
 		igt_assert_neq(bo.handle, 0);
 		igt_assert_eq(bo.size, expected_size);
 
