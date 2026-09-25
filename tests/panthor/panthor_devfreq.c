@@ -15,6 +15,7 @@
 #include "igt_panthor.h"
 #include "igt_syncobj.h"
 #include "panthor_drm.h"
+#include "sw_sync.h"
 
 /*
  * Behaviour tests for the Tyr/Panthor devfreq integration. Drives the GPU
@@ -38,12 +39,14 @@
 #define SEC_NS		1000000000ULL
 
 /*
- * Iteration count for the workload. ~5 GPU instructions per iteration; at the
- * Mali-G610 boot frequency (~198MHz) this lands comfortably in the multi-second
- * range, giving the simple_ondemand governor (default 100ms polling) ample
- * opportunity to ramp up before the job completes.
+ * Iteration count for one job. A Mali-G610 runs 100k iterations in about
+ * 0.73 s with devfreq active and about 1.5x slower at its lowest OPP, so one
+ * job takes about 0.45 s, well under the driver's 5 s job timeout.
  */
-#define DEVFREQ_LOOP_N	5000000
+#define DEVFREQ_LOOP_N	40000
+
+/* Jobs kept queued back to back to sustain the load. */
+#define DEVFREQ_JOBS	3
 
 /* GPU core masks, queried once in the top fixture. */
 static uint64_t g_shader_present;
@@ -62,6 +65,19 @@ static bool wait_done(int fd, uint32_t syncobj, int64_t rel_ns)
 {
 	return syncobj_wait(fd, &syncobj, 1, abs_timeout(rel_ns),
 			    DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL, NULL);
+}
+
+/* Status of the fence a syncobj carries: 1 completed, negative on error. */
+static int fence_status(int fd, uint32_t syncobj)
+{
+	int fence, status;
+
+	fence = syncobj_handle_to_fd(fd, syncobj,
+				     DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_EXPORT_SYNC_FILE);
+	status = sync_fence_status(fence);
+	close(fence);
+
+	return status;
 }
 
 /*
@@ -284,15 +300,62 @@ static struct drm_panthor_sync_op signal_op(uint32_t syncobj)
 }
 
 /*
- * A long counted-loop workload: its handles and the mapped scratch BO. Submit
- * it with submit_long_workload(), wait on .syncobj, then tear it down.
+ * A sustained counted-loop workload: its handles, the mapped scratch BO and
+ * the jobs in flight. Start it with submit_long_workload(), call
+ * pump_workload() at least every 100 ms to keep the queue full, then drain it
+ * with finish_workload() and tear it down.
  */
 struct workload {
 	uint32_t vm_id;
 	uint32_t group_handle;
-	uint32_t syncobj;
+	uint32_t syncobjs[DEVFREQ_JOBS];
+	unsigned int submitted;
+	unsigned int retired;
+	uint64_t stream_size;
 	struct panthor_bo bo;
 };
+
+static void submit_job(int fd, struct workload *w)
+{
+	struct drm_panthor_sync_op sync;
+	struct drm_panthor_queue_submit submit;
+	struct drm_panthor_group_submit group_submit;
+
+	sync = signal_op(w->syncobjs[w->submitted % DEVFREQ_JOBS]);
+	submit = (struct drm_panthor_queue_submit){
+		.queue_index = 0,
+		.stream_addr = INITIAL_VA,
+		.stream_size = w->stream_size,
+		.syncs = DRM_PANTHOR_OBJ_ARRAY(1, &sync),
+	};
+	group_submit = (struct drm_panthor_group_submit){
+		.group_handle = w->group_handle,
+		.queue_submits = DRM_PANTHOR_OBJ_ARRAY(1, &submit),
+	};
+	igt_panthor_group_submit(fd, &group_submit, 0);
+	w->submitted++;
+}
+
+/* Retire the oldest job, failing if the driver killed it or it timed out. */
+static void retire_job(int fd, struct workload *w)
+{
+	int status = fence_status(fd, w->syncobjs[w->retired % DEVFREQ_JOBS]);
+
+	igt_assert_f(status == 1, "job %u failed with status %d\n",
+		     w->retired, status);
+	w->retired++;
+}
+
+/* Retire the finished jobs and refill the queue. */
+static void pump_workload(int fd, struct workload *w)
+{
+	while (w->retired < w->submitted &&
+	       wait_done(fd, w->syncobjs[w->retired % DEVFREQ_JOBS], 0))
+		retire_job(fd, w);
+
+	while (w->submitted - w->retired < DEVFREQ_JOBS)
+		submit_job(fd, w);
+}
 
 static void submit_long_workload(int fd, struct workload *w)
 {
@@ -300,14 +363,12 @@ static void submit_long_workload(int fd, struct workload *w)
 		.priority = 0, .ringbuf_size = 4096,
 	};
 	struct drm_panthor_group_create cfg;
-	struct drm_panthor_sync_op sync;
-	struct drm_panthor_queue_submit submit;
-	struct drm_panthor_group_submit group_submit;
 	uint64_t instrs[16];
 	int ninstrs;
 
 	igt_panthor_vm_create(fd, &w->vm_id, 0);
-	w->syncobj = syncobj_create(fd, 0);
+	for (int i = 0; i < DEVFREQ_JOBS; i++)
+		w->syncobjs[i] = syncobj_create(fd, 0);
 	igt_panthor_bo_create_mapped(fd, &w->bo, 4096, 0, 0);
 
 	*(volatile uint32_t *)((uint8_t *)w->bo.map + COUNTER_OFFSET) = 0;
@@ -315,6 +376,7 @@ static void submit_long_workload(int fd, struct workload *w)
 	ninstrs = emit_counted_loop(instrs, INITIAL_VA + COUNTER_OFFSET,
 				    DEVFREQ_LOOP_N);
 	memcpy(w->bo.map, instrs, ninstrs * sizeof(instrs[0]));
+	w->stream_size = ninstrs * sizeof(instrs[0]);
 
 	igt_panthor_vm_bind(fd, w->vm_id, w->bo.handle, INITIAL_VA, w->bo.size,
 			    DRM_PANTHOR_VM_BIND_OP_TYPE_MAP |
@@ -324,24 +386,34 @@ static void submit_long_workload(int fd, struct workload *w)
 	igt_panthor_group_create(fd, &cfg, 0);
 	w->group_handle = cfg.group_handle;
 
-	sync = signal_op(w->syncobj);
-	submit = (struct drm_panthor_queue_submit){
-		.queue_index = 0,
-		.stream_addr = INITIAL_VA,
-		.stream_size = ninstrs * sizeof(instrs[0]),
-		.syncs = DRM_PANTHOR_OBJ_ARRAY(1, &sync),
-	};
-	group_submit = (struct drm_panthor_group_submit){
-		.group_handle = w->group_handle,
-		.queue_submits = DRM_PANTHOR_OBJ_ARRAY(1, &submit),
-	};
-	igt_panthor_group_submit(fd, &group_submit, 0);
+	pump_workload(fd, w);
+}
+
+/*
+ * Wait for the queued jobs and check each one succeeded. A hung job ends at
+ * the driver's job timeout with an error on its fence, so the wait budget
+ * only needs to cover that timeout.
+ */
+static void finish_workload(int fd, struct workload *w)
+{
+	while (w->retired < w->submitted) {
+		igt_assert_f(wait_done(fd, w->syncobjs[w->retired % DEVFREQ_JOBS],
+				       10 * SEC_NS),
+			     "job %u did not signal\n", w->retired);
+		retire_job(fd, w);
+	}
+
+	igt_assert_eq_u32(*(volatile uint32_t *)((uint8_t *)w->bo.map +
+						 COUNTER_OFFSET),
+			  DEVFREQ_LOOP_N);
+	igt_info("ran %u jobs of %u iterations\n", w->retired, DEVFREQ_LOOP_N);
 }
 
 static void teardown_workload(int fd, struct workload *w)
 {
 	igt_panthor_group_destroy(fd, w->group_handle, 0);
-	syncobj_destroy(fd, w->syncobj);
+	for (int i = 0; i < DEVFREQ_JOBS; i++)
+		syncobj_destroy(fd, w->syncobjs[i]);
 	igt_panthor_free_bo(fd, &w->bo);
 	igt_panthor_vm_destroy(fd, w->vm_id, 0);
 }
@@ -426,6 +498,7 @@ int igt_main()
 			unsigned long long f;
 
 			usleep(100000);
+			pump_workload(fd, &w);
 			f = read_sysfs_u64(devfreq, "cur_freq");
 			if (f > peak)
 				peak = f;
@@ -437,9 +510,7 @@ int igt_main()
 			     "cur_freq did not rise above baseline %llu (peak %llu)\n",
 			     baseline, peak);
 
-		/* Generous budget: clock may be starved on a non-devfreq pin. */
-		igt_assert_f(wait_done(fd, w.syncobj, 60 * SEC_NS),
-			     "workload timed out\n");
+		finish_workload(fd, &w);
 		teardown_workload(fd, &w);
 	}
 
@@ -466,12 +537,12 @@ int igt_main()
 			unsigned long long f;
 
 			usleep(100000);
+			pump_workload(fd, &w);
 			f = read_sysfs_u64(devfreq, "cur_freq");
 			if (f > peak)
 				peak = f;
 		}
-		igt_assert_f(wait_done(fd, w.syncobj, 60 * SEC_NS),
-			     "workload timed out\n");
+		finish_workload(fd, &w);
 		teardown_workload(fd, &w);
 		igt_info("peak cur_freq under load = %llu Hz\n", peak);
 
@@ -508,10 +579,11 @@ int igt_main()
 		 */
 		if (count_opps(devfreq) > 1) {
 			submit_long_workload(fd, &w);
-			for (int i = 0; i < 20; i++)
+			for (int i = 0; i < 20; i++) {
 				usleep(100000);
-			igt_assert_f(wait_done(fd, w.syncobj, 60 * SEC_NS),
-				     "workload timed out\n");
+				pump_workload(fd, &w);
+			}
+			finish_workload(fd, &w);
 			teardown_workload(fd, &w);
 			sleep(2);
 		}
