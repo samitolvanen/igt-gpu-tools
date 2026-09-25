@@ -1266,10 +1266,9 @@ int igt_main() {
 		igt_panthor_vm_destroy(fd, vm_id, 0);
 	}
 
-	igt_describe("An async bind op that only fails once the bind queue runs "
-		     "it reports the error through its fence and leaves the VM "
-		     "unusable");
-	igt_subtest("vm_bind_async_failure_state") {
+	igt_describe("An async VM_BIND array with an out-of-range op is rejected "
+		     "as a whole at ioctl entry and leaves the VM usable");
+	igt_subtest("vm_bind_async_array_rejected") {
 		struct drm_panthor_gpu_info gpu_info = {};
 		struct drm_panthor_sync_op syncs[2];
 		struct drm_panthor_vm_bind_op ops[2];
@@ -1278,7 +1277,6 @@ int igt_main() {
 		uint32_t vm_id, good, bad;
 		uint64_t out_of_range;
 		uint32_t va_bits;
-		int status;
 
 		require_async_vm_bind(fd);
 
@@ -1289,9 +1287,8 @@ int igt_main() {
 			      "unexpected VA size of %u bits\n", va_bits);
 
 		/*
-		 * The first address past the range the VM manages. Alignment
-		 * and buffer bounds are all that the ioctl checks, so this op
-		 * is only rejected once the bind queue runs it.
+		 * The first address past the range the VM manages. The ioctl
+		 * checks the range of every op before it queues any of them.
 		 */
 		out_of_range = 1ULL << va_bits;
 
@@ -1323,46 +1320,18 @@ int igt_main() {
 			.ops = DRM_PANTHOR_OBJ_ARRAY(2, ops),
 		};
 
-		igt_assert_f(igt_ioctl(fd, DRM_IOCTL_PANTHOR_VM_BIND, &bind) == 0,
-			     "deferred failure rejected at ioctl entry (errno %d)\n",
-			     errno);
+		igt_assert_eq(igt_ioctl(fd, DRM_IOCTL_PANTHOR_VM_BIND, &bind), -1);
+		igt_assert_eq(errno, EINVAL);
 
-		assert_completed(fd, good, "first map");
-
-		igt_assert_f(wait_done(fd, bad, WAIT_NS),
-			     "failing map did not retire\n");
-		status = fence_status(fd, bad);
-		igt_assert_f(status < 0, "failing map reported status %d\n",
-			     status);
+		/* Neither op was queued, so neither syncobj got a fence. */
+		igt_assert_eq(syncobj_wait_err(fd, &good, 1, 0, 0), -EINVAL);
+		igt_assert_eq(syncobj_wait_err(fd, &bad, 1, 0, 0), -EINVAL);
 
 		igt_assert_eq_u32(vm_state(fd, vm_id),
-				  DRM_PANTHOR_VM_STATE_UNUSABLE);
+				  DRM_PANTHOR_VM_STATE_USABLE);
 
-		/*
-		 * An unusable VM refuses every further bind except the
-		 * synchronous unmap userspace needs to tear it down.
-		 */
-		{
-			struct drm_panthor_vm_bind_op op = {
-				.flags = DRM_PANTHOR_VM_BIND_OP_TYPE_MAP,
-				.bo_handle = bo.handle,
-				.va = TEST_VA + PAGE_SIZE,
-				.size = PAGE_SIZE,
-			};
-			igt_assert_eq(do_async_bind_op(fd, vm_id, &op), -1);
-			igt_assert_eq(errno, EINVAL);
-		}
-
-		{
-			struct drm_panthor_vm_bind_op op = {
-				.flags = DRM_PANTHOR_VM_BIND_OP_TYPE_MAP,
-				.bo_handle = bo.handle,
-				.va = TEST_VA + PAGE_SIZE,
-				.size = PAGE_SIZE,
-			};
-			igt_assert_eq(do_sync_bind_op(fd, vm_id, &op), -1);
-			igt_assert_eq(errno, EINVAL);
-		}
+		/* The valid op alone still goes through. */
+		igt_assert_eq(do_async_bind_op(fd, vm_id, &ops[0]), 0);
 
 		{
 			struct drm_panthor_vm_bind_op op = {
