@@ -21,8 +21,9 @@
  * multi-queue groups, sync-wait blocking, job timeout, fatal faults, large
  * instruction streams, ring-buffer wrap, group destruction with active jobs,
  * multi-queue dependency chains, VM isolation across a fatal fault,
- * unbinding a range an active job uses, recovery after a job timeout, and
- * sync waits the driver evaluates while their group is off its slot.
+ * unbinding a range an active job uses, recovery after a job timeout,
+ * sync waits the driver evaluates while their group is off its slot, and
+ * filling a ring buffer up to its last cache line.
  */
 
 #define INITIAL_VA	0x1000000
@@ -484,6 +485,180 @@ static void release_offslot(int fd, uint32_t waiter, void *sync,
 	igt_panthor_vm_destroy(fd, vm_id, 0);
 	free(groups);
 	free(syncobjs);
+}
+
+/*
+ * Ring buffer fill tests.
+ *
+ * The hardware considers a CS ring buffer full one 64-byte cache line short
+ * of its size: INSERT - EXTRACT must never exceed the ring size less 64
+ * bytes. Filling it past that can fault the stream.
+ *
+ * These are the board tests for that rule. On a driver that keeps the last
+ * cache line free, they pass. On one that does not, running them on real
+ * hardware shows what the firmware does: a group fault, a timeout, or
+ * nothing at all.
+ *
+ * Both tests use a 4 KiB ring. Tyr wraps each stream submit in 11
+ * instructions and pads the job to a cache line, and Panthor makes one
+ * 128-byte job of each.
+ *
+ * - ring_merged_submit_fill: one GROUP_SUBMIT with RING_MERGED_FULL stream
+ *   submits on one queue, which Tyr merges into one job of 4096 bytes. The
+ *   driver must either reject it with ENOSPC or run it without a fault.
+ *   ring_merged_submit_fits is the same with one submit less, 3968 bytes,
+ *   which must run.
+ * - ring_blocked_fill: a job blocked on a SYNC_WAIT32 and 31 more behind it,
+ *   one per GROUP_SUBMIT, 32 jobs of 128 bytes in total. Every job must
+ *   complete once the wait is released.
+ */
+#define RING_BYTES		4096
+#define RING_JOB_BYTES		128
+
+/* Tyr's 11 wrapper instructions per stream submit. */
+#define TYR_WRAPPER_BYTES	88
+#define RING_MERGED_FULL	(RING_BYTES / TYR_WRAPPER_BYTES)
+
+/* Byte offsets inside the ring tests' BO, after the streams. */
+#define RING_STARTED_OFFSET	2048
+#define RING_RELEASE_OFFSET	2056
+
+static uint32_t group_state(int fd, uint32_t group_handle)
+{
+	struct drm_panthor_group_get_state get_state = {
+		.group_handle = group_handle,
+	};
+
+	do_ioctl(fd, DRM_IOCTL_PANTHOR_GROUP_GET_STATE, &get_state);
+
+	return get_state.state;
+}
+
+static uint32_t ring_test_group(int fd, uint32_t vm_id)
+{
+	struct drm_panthor_queue_create queue = {
+		.priority = 0, .ringbuf_size = RING_BYTES,
+	};
+	struct drm_panthor_group_create cfg;
+
+	cfg = make_group_cfg(&queue, 1, PANTHOR_GROUP_PRIORITY_MEDIUM, vm_id);
+	igt_panthor_group_create(fd, &cfg, 0);
+
+	return cfg.group_handle;
+}
+
+/*
+ * Submit npieces single-MOV32 stream submits to queue 0 in one GROUP_SUBMIT,
+ * with the last one signaling a syncobj. The driver may reject the
+ * submission only if may_reject is set, and only with ENOSPC. Otherwise
+ * the job must complete without a fault.
+ */
+static void ring_merged_submit(int fd, int npieces, bool may_reject)
+{
+	struct drm_panthor_queue_submit submits[RING_MERGED_FULL] = {};
+	struct drm_panthor_group_submit group_submit = {};
+	struct drm_panthor_sync_op sync;
+	struct panthor_bo bo = {};
+	uint32_t vm_id, group_handle, syncobj;
+	uint64_t instr = cs_mov32(20, 1);
+	int status, ret;
+
+	igt_assert(npieces <= RING_MERGED_FULL);
+
+	igt_panthor_vm_create(fd, &vm_id, 0);
+	igt_panthor_bo_create_mapped(fd, &bo, 4096, 0, 0);
+	memcpy(bo.map, &instr, sizeof(instr));
+	igt_panthor_vm_bind(fd, vm_id, bo.handle, INITIAL_VA, bo.size,
+			    DRM_PANTHOR_VM_BIND_OP_TYPE_MAP, 0);
+	group_handle = ring_test_group(fd, vm_id);
+
+	syncobj = syncobj_create(fd, 0);
+	sync = signal_op(syncobj);
+	for (int i = 0; i < npieces; i++) {
+		submits[i].queue_index = 0;
+		submits[i].stream_addr = INITIAL_VA;
+		submits[i].stream_size = sizeof(instr);
+	}
+	submits[npieces - 1].syncs = (struct drm_panthor_obj_array)
+		DRM_PANTHOR_OBJ_ARRAY(1, &sync);
+	group_submit.group_handle = group_handle;
+	group_submit.queue_submits = (struct drm_panthor_obj_array)
+		DRM_PANTHOR_OBJ_ARRAY(npieces, submits);
+
+	ret = igt_ioctl(fd, DRM_IOCTL_PANTHOR_GROUP_SUBMIT, &group_submit) ?
+	      -errno : 0;
+	if (ret == -ENOSPC && may_reject) {
+		igt_info("%d stream submits rejected with ENOSPC\n", npieces);
+	} else {
+		igt_assert_f(ret == 0, "GROUP_SUBMIT of %d stream submits: %s\n",
+			     npieces, strerror(-ret));
+		igt_assert_f(wait_done(fd, syncobj, 10 * SEC_NS),
+			     "the job timed out\n");
+		status = fence_status(fd, syncobj);
+		igt_assert_f(status == 1, "the job failed (fence status %d)\n",
+			     status);
+	}
+	igt_assert_eq_u32(group_state(fd, group_handle), 0);
+
+	syncobj_destroy(fd, syncobj);
+	igt_panthor_group_destroy(fd, group_handle, 0);
+	igt_panthor_free_bo(fd, &bo);
+	igt_panthor_vm_destroy(fd, vm_id, 0);
+}
+
+/*
+ * Emit a stream that sets the started flag and then waits until the release
+ * word is nonzero.
+ */
+static int emit_ring_blocked(uint64_t *instrs)
+{
+	int k = 0;
+
+	instrs[k++] = cs_mov48(8, INITIAL_VA + RING_STARTED_OFFSET);
+	instrs[k++] = cs_mov32(6, 1);
+	instrs[k++] = cs_sync_set32(8, 6);
+	instrs[k++] = cs_mov48(0, INITIAL_VA + RING_RELEASE_OFFSET);
+	instrs[k++] = cs_mov32(2, 0);
+	instrs[k++] = cs_sync_wait32(0, 2, CS_CONDITION_GT);
+
+	return k;
+}
+
+/*
+ * Submit and wait for a trivial job on a fresh group. Its completion makes
+ * the scheduler look at every blocked queue again, which a bare CPU write to
+ * host memory does not.
+ */
+static void kick_scheduler(int fd)
+{
+	struct drm_panthor_queue_create queue = {
+		.priority = 0, .ringbuf_size = 4096,
+	};
+	struct drm_panthor_group_create cfg;
+	struct drm_panthor_sync_op sync;
+	struct panthor_bo bo = {};
+	uint64_t instr = cs_mov32(20, 1);
+	uint32_t vm_id, syncobj;
+
+	igt_panthor_vm_create(fd, &vm_id, 0);
+	igt_panthor_bo_create_mapped(fd, &bo, 4096, 0, 0);
+	memcpy(bo.map, &instr, sizeof(instr));
+	igt_panthor_vm_bind(fd, vm_id, bo.handle, INITIAL_VA, bo.size,
+			    DRM_PANTHOR_VM_BIND_OP_TYPE_MAP, 0);
+
+	cfg = make_group_cfg(&queue, 1, PANTHOR_GROUP_PRIORITY_MEDIUM, vm_id);
+	igt_panthor_group_create(fd, &cfg, 0);
+
+	syncobj = syncobj_create(fd, 0);
+	sync = signal_op(syncobj);
+	submit_stream(fd, cfg.group_handle, 0, INITIAL_VA, sizeof(instr),
+		      &sync, 1);
+	igt_assert(wait_done(fd, syncobj, 10 * SEC_NS));
+
+	syncobj_destroy(fd, syncobj);
+	igt_panthor_group_destroy(fd, cfg.group_handle, 0);
+	igt_panthor_free_bo(fd, &bo);
+	igt_panthor_vm_destroy(fd, vm_id, 0);
 }
 
 int igt_main()
@@ -1885,6 +2060,84 @@ int igt_main()
 		igt_panthor_group_destroy(fd, cfg.group_handle, 0);
 		igt_panthor_free_bo(fd, &second);
 		igt_panthor_free_bo(fd, &code);
+		igt_panthor_vm_destroy(fd, vm_id, 0);
+	}
+
+	igt_describe("One GROUP_SUBMIT whose stream submits fill a 4 KiB ring "
+		     "as one job must fail with ENOSPC or complete without a "
+		     "fault.");
+	igt_subtest("ring_merged_submit_fill")
+		ring_merged_submit(fd, RING_MERGED_FULL, true);
+
+	igt_describe("One GROUP_SUBMIT with one stream submit less than "
+		     "ring_merged_submit_fill must complete without a fault.");
+	igt_subtest("ring_merged_submit_fits")
+		ring_merged_submit(fd, RING_MERGED_FULL - 1, false);
+
+	igt_describe("A job blocked on a SYNC_WAIT32 and 31 more behind it fill "
+		     "a 4 KiB ring; all must complete without a fault once the "
+		     "wait is released.");
+	igt_subtest("ring_blocked_fill") {
+		const int njobs = RING_BYTES / RING_JOB_BYTES;
+		volatile uint32_t *started, *release;
+		struct drm_panthor_sync_op sync;
+		uint32_t vm_id, group_handle;
+		struct panthor_bo bo = {};
+		uint32_t syncobjs[RING_BYTES / RING_JOB_BYTES];
+		uint64_t instrs[8];
+		int ninstrs, status;
+
+		igt_panthor_vm_create(fd, &vm_id, 0);
+		igt_panthor_bo_create_mapped(fd, &bo, 4096, 0, 0);
+		started = (volatile uint32_t *)((uint8_t *)bo.map +
+						RING_STARTED_OFFSET);
+		release = (volatile uint32_t *)((uint8_t *)bo.map +
+						RING_RELEASE_OFFSET);
+		*started = 0;
+		*release = 0;
+		ninstrs = emit_ring_blocked(instrs);
+		memcpy(bo.map, instrs, ninstrs * sizeof(instrs[0]));
+		igt_panthor_vm_bind(fd, vm_id, bo.handle, INITIAL_VA, bo.size,
+				    DRM_PANTHOR_VM_BIND_OP_TYPE_MAP, 0);
+		group_handle = ring_test_group(fd, vm_id);
+
+		/* Job 0 reaches its SYNC_WAIT before the others arrive. */
+		syncobjs[0] = syncobj_create(fd, 0);
+		sync = signal_op(syncobjs[0]);
+		submit_stream(fd, group_handle, 0, INITIAL_VA,
+			      ninstrs * sizeof(instrs[0]), &sync, 1);
+		wait_started(started);
+
+		for (int i = 1; i < njobs; i++) {
+			syncobjs[i] = syncobj_create(fd, 0);
+			sync = signal_op(syncobjs[i]);
+			submit_stream(fd, group_handle, 0, INITIAL_VA,
+				      ninstrs * sizeof(instrs[0]), &sync, 1);
+		}
+
+		/* A job that completes now has failed. */
+		if (wait_done(fd, syncobjs[0], SEC_NS / 2))
+			igt_assert_f(false, "the blocked job completed before "
+				     "its release (fence status %d)\n",
+				     fence_status(fd, syncobjs[0]));
+		igt_assert_eq_u32(group_state(fd, group_handle), 0);
+
+		*release = 1;
+		kick_scheduler(fd);
+		for (int i = 0; i < njobs; i++) {
+			igt_assert_f(wait_done(fd, syncobjs[i], 10 * SEC_NS),
+				     "job %d timed out\n", i);
+			status = fence_status(fd, syncobjs[i]);
+			igt_assert_f(status == 1,
+				     "job %d failed (fence status %d)\n", i,
+				     status);
+		}
+		igt_assert_eq_u32(group_state(fd, group_handle), 0);
+
+		for (int i = 0; i < njobs; i++)
+			syncobj_destroy(fd, syncobjs[i]);
+		igt_panthor_group_destroy(fd, group_handle, 0);
+		igt_panthor_free_bo(fd, &bo);
 		igt_panthor_vm_destroy(fd, vm_id, 0);
 	}
 
