@@ -918,85 +918,13 @@ int igt_main()
 		run_loop_groups(fd, g_slots);
 	}
 
-	igt_describe("Overcommit CSG slots by one and verify time-slicing lets "
-		     "every counted-loop group start and complete.");
+	igt_describe("Overcommit CSG slots by one with counted loops that only a "
+		     "group destroy can end, and verify time-slicing starts every "
+		     "group and keeps all of them making progress.");
 	igt_subtest("csg_slots_overcommit") {
 		int kmsg_fd = kmsg_open();
-		uint32_t n = g_slots + 1;
-		uint32_t *vm_ids = calloc(n, sizeof(*vm_ids));
-		uint32_t *groups = calloc(n, sizeof(*groups));
-		uint32_t *syncobjs = calloc(n, sizeof(*syncobjs));
-		struct panthor_bo *bos = calloc(n, sizeof(*bos));
 
-		for (uint32_t i = 0; i < n; i++) {
-			struct drm_panthor_queue_create queue = {
-				.priority = 0, .ringbuf_size = 4096,
-			};
-			struct drm_panthor_group_create cfg;
-			struct drm_panthor_sync_op sync;
-			uint64_t instrs[16];
-			int ninstrs;
-
-			igt_panthor_vm_create(fd, &vm_ids[i], 0);
-			syncobjs[i] = syncobj_create(fd, 0);
-			igt_panthor_bo_create_mapped(fd, &bos[i], 4096, 0, 0);
-
-			*(volatile uint32_t *)((uint8_t *)bos[i].map + STARTED_OFFSET) = 0;
-			*(volatile uint32_t *)((uint8_t *)bos[i].map + COUNTER_OFFSET) = 0;
-
-			ninstrs = emit_counted_loop(instrs,
-						    INITIAL_VA + COUNTER_OFFSET,
-						    INITIAL_VA + STARTED_OFFSET,
-						    COUNTED_LOOP_N);
-			memcpy(bos[i].map, instrs, ninstrs * sizeof(instrs[0]));
-
-			igt_panthor_vm_bind(fd, vm_ids[i], bos[i].handle,
-					    INITIAL_VA, bos[i].size,
-					    DRM_PANTHOR_VM_BIND_OP_TYPE_MAP |
-					    DRM_PANTHOR_VM_BIND_OP_MAP_UNCACHED, 0);
-
-			cfg = make_group_cfg(&queue, 1,
-					     PANTHOR_GROUP_PRIORITY_LOW, vm_ids[i]);
-			igt_panthor_group_create(fd, &cfg, 0);
-			groups[i] = cfg.group_handle;
-
-			sync = signal_op(syncobjs[i]);
-			submit_stream(fd, groups[i], 0, INITIAL_VA,
-				      ninstrs * sizeof(instrs[0]), &sync, 1);
-		}
-
-		/* slots+1 jobs: at least one must wait for a time-slice. */
-		for (uint32_t i = 0; i < n; i++) {
-			volatile uint32_t *started =
-				(volatile uint32_t *)((uint8_t *)bos[i].map + STARTED_OFFSET);
-			int retries = 1000;
-
-			while (*started == 0 && retries--)
-				usleep(10000);
-			igt_assert_f(*started != 0, "job %u failed to start "
-				     "(time-slicing too slow?)\n", i);
-		}
-
-		for (uint32_t i = 0; i < n; i++) {
-			volatile uint32_t *counter =
-				(volatile uint32_t *)((uint8_t *)bos[i].map + COUNTER_OFFSET);
-
-			igt_assert_f(wait_done(fd, syncobjs[i], 15 * SEC_NS),
-				     "job %u timed out\n", i);
-			igt_assert_eq_u32(*counter, COUNTED_LOOP_N);
-		}
-
-		for (uint32_t i = 0; i < n; i++) {
-			igt_panthor_group_destroy(fd, groups[i], 0);
-			syncobj_destroy(fd, syncobjs[i]);
-			igt_panthor_free_bo(fd, &bos[i]);
-			igt_panthor_vm_destroy(fd, vm_ids[i], 0);
-		}
-		free(vm_ids);
-		free(groups);
-		free(syncobjs);
-		free(bos);
-
+		run_loop_groups(fd, g_slots + 1);
 		assert_no_wedge(kmsg_fd);
 	}
 
@@ -1329,84 +1257,13 @@ int igt_main()
 		igt_panthor_vm_destroy(fd, vm_id, 0);
 	}
 
-	igt_describe("Overcommit CSG slots 2x with counted loops and verify "
-		     "extreme time-slicing still completes every group.");
+	igt_describe("Overcommit CSG slots 2x with counted loops that only a "
+		     "group destroy can end, and verify time-slicing starts every "
+		     "group and keeps all of them making progress.");
 	igt_subtest("csg_slots_extreme_overcommit") {
 		int kmsg_fd = kmsg_open();
-		uint32_t n = g_slots * 2;
-		uint32_t *vm_ids = calloc(n, sizeof(*vm_ids));
-		uint32_t *groups = calloc(n, sizeof(*groups));
-		uint32_t *syncobjs = calloc(n, sizeof(*syncobjs));
-		struct panthor_bo *bos = calloc(n, sizeof(*bos));
 
-		for (uint32_t i = 0; i < n; i++) {
-			struct drm_panthor_queue_create queue = {
-				.priority = 0, .ringbuf_size = 4096,
-			};
-			struct drm_panthor_group_create cfg;
-			struct drm_panthor_sync_op sync;
-			uint64_t instrs[16];
-			int ninstrs;
-
-			igt_panthor_vm_create(fd, &vm_ids[i], 0);
-			syncobjs[i] = syncobj_create(fd, 0);
-			igt_panthor_bo_create_mapped(fd, &bos[i], 4096, 0, 0);
-
-			*(volatile uint32_t *)((uint8_t *)bos[i].map + STARTED_OFFSET) = 0;
-			*(volatile uint32_t *)((uint8_t *)bos[i].map + COUNTER_OFFSET) = 0;
-
-			ninstrs = emit_counted_loop(instrs,
-						    INITIAL_VA + COUNTER_OFFSET,
-						    INITIAL_VA + STARTED_OFFSET,
-						    COUNTED_LOOP_N);
-			memcpy(bos[i].map, instrs, ninstrs * sizeof(instrs[0]));
-
-			igt_panthor_vm_bind(fd, vm_ids[i], bos[i].handle,
-					    INITIAL_VA, bos[i].size,
-					    DRM_PANTHOR_VM_BIND_OP_TYPE_MAP |
-					    DRM_PANTHOR_VM_BIND_OP_MAP_UNCACHED, 0);
-
-			cfg = make_group_cfg(&queue, 1,
-					     PANTHOR_GROUP_PRIORITY_LOW, vm_ids[i]);
-			igt_panthor_group_create(fd, &cfg, 0);
-			groups[i] = cfg.group_handle;
-
-			sync = signal_op(syncobjs[i]);
-			submit_stream(fd, groups[i], 0, INITIAL_VA,
-				      ninstrs * sizeof(instrs[0]), &sync, 1);
-		}
-
-		for (uint32_t i = 0; i < n; i++) {
-			volatile uint32_t *started =
-				(volatile uint32_t *)((uint8_t *)bos[i].map + STARTED_OFFSET);
-			int retries = 2000;
-
-			while (*started == 0 && retries--)
-				usleep(10000);
-			igt_assert_f(*started != 0, "job %u failed to start "
-				     "(time-slicing too slow?)\n", i);
-		}
-
-		for (uint32_t i = 0; i < n; i++) {
-			volatile uint32_t *counter =
-				(volatile uint32_t *)((uint8_t *)bos[i].map + COUNTER_OFFSET);
-
-			igt_assert_f(wait_done(fd, syncobjs[i], 20 * SEC_NS),
-				     "job %u timed out\n", i);
-			igt_assert_eq_u32(*counter, COUNTED_LOOP_N);
-		}
-
-		for (uint32_t i = 0; i < n; i++) {
-			igt_panthor_group_destroy(fd, groups[i], 0);
-			syncobj_destroy(fd, syncobjs[i]);
-			igt_panthor_free_bo(fd, &bos[i]);
-			igt_panthor_vm_destroy(fd, vm_ids[i], 0);
-		}
-		free(vm_ids);
-		free(groups);
-		free(syncobjs);
-		free(bos);
-
+		run_loop_groups(fd, g_slots * 2);
 		assert_no_wedge(kmsg_fd);
 	}
 
