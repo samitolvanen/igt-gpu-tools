@@ -1523,7 +1523,8 @@ int igt_main()
 		struct drm_panthor_sync_op sync;
 		volatile uint32_t *started, *counter;
 		uint64_t instrs[16];
-		int ninstrs;
+		int ninstrs, retries;
+		uint32_t count;
 
 		igt_panthor_vm_create(fd, &vm_id, 0);
 		syncobj = syncobj_create(fd, 0);
@@ -1537,9 +1538,10 @@ int igt_main()
 		*started = 0;
 		*counter = 0;
 
+		/* The loop cannot finish before the job timeout. */
 		ninstrs = emit_counted_loop(instrs, INITIAL_VA + COUNTER_OFFSET,
 					    INITIAL_VA + STARTED_OFFSET,
-					    COUNTED_LOOP_N);
+					    UINT32_MAX);
 		memcpy(bo.map, instrs, ninstrs * sizeof(instrs[0]));
 
 		cfg = make_group_cfg(&queue, 1, PANTHOR_GROUP_PRIORITY_LOW, vm_id);
@@ -1550,19 +1552,23 @@ int igt_main()
 		submit_stream(fd, group_handle, 0, INITIAL_VA,
 			      ninstrs * sizeof(instrs[0]), &sync, 1);
 
-		while (*started == 0)
-			usleep(10000);
+		retries = 10000;
+		while (*started == 0 && retries--)
+			usleep(100);
+		igt_assert_f(*started != 0, "the job failed to start\n");
 
 		/* Destroy while genuinely running: must succeed. */
 		igt_panthor_group_destroy(fd, group_handle, 0);
 
 		/*
-		 * The teardown cancels the in-flight submit, so the syncobj may
-		 * legitimately signal afterwards; poll only for diagnostics. The
-		 * real check is that the loop was interrupted short of N.
+		 * Only the teardown can end the loop this soon, well before the
+		 * job timeout. Once the fence signals, the counter must stop.
 		 */
-		wait_done(fd, syncobj, SEC_NS / 2);
-		igt_assert_lt_u32(*counter, COUNTED_LOOP_N);
+		igt_assert(wait_done(fd, syncobj, 2 * SEC_NS));
+		count = *counter;
+		usleep(10000);
+		igt_assert_eq_u32(*counter, count);
+		igt_assert_lt_u32(count, UINT32_MAX);
 
 		syncobj_destroy(fd, syncobj);
 		igt_panthor_free_bo(fd, &bo);
