@@ -21,7 +21,8 @@
  * multi-queue groups, sync-wait blocking, job timeout, fatal faults, large
  * instruction streams, ring-buffer wrap, group destruction with active jobs,
  * multi-queue dependency chains, VM isolation across a fatal fault,
- * unbinding a range an active job uses, and recovery after a job timeout.
+ * unbinding a range an active job uses, recovery after a job timeout, and
+ * sync waits the driver evaluates while their group is off its slot.
  */
 
 #define INITIAL_VA	0x1000000
@@ -31,6 +32,9 @@
 
 /* Where run_fresh_group() maps its own scratch BO. */
 #define FRESH_VA	0x1020000
+
+/* Where the off-slot sync wait tests map the BO holding the sync object. */
+#define SYNC_VA		0x1030000
 
 /* Byte offsets inside the per-group scratch BO. */
 #define STARTED_OFFSET	2056
@@ -325,6 +329,161 @@ static void assert_no_wedge(int kmsg_fd)
 
 	igt_assert_f(!found,
 		     "the GPU was reset or lost a job during the subtest\n");
+}
+
+/*
+ * Sync waits the driver evaluates itself. A group whose queue blocks on a
+ * SYNC_WAIT is idle, so the scheduler takes its slot when busier groups need
+ * one, and from then on the driver, not the firmware, decides when the wait
+ * is satisfied. It reads the sync object and compares it against the value
+ * the firmware reported for the wait.
+ */
+struct syncwait_case {
+	const char *name;
+	bool sync64;
+	enum cs_condition condition;
+	uint64_t ref;
+	uint64_t blocked;
+	uint64_t released;
+};
+
+/*
+ * The 64-bit cases put the reference, the blocking and the releasing values
+ * above 32 bits, so that a wait read as 32 bits would never be satisfied.
+ * The LE cases release on equality.
+ */
+static const struct syncwait_case syncwait_cases[] = {
+	{ "32bit_gt", false, CS_CONDITION_GT, 1, 1, 2 },
+	{ "32bit_le", false, CS_CONDITION_LE, 2, 3, 2 },
+	{ "64bit_gt", true, CS_CONDITION_GT,
+	  0x100000000ULL, 0x100000000ULL, 0x100000001ULL },
+	{ "64bit_le", true, CS_CONDITION_LE,
+	  0x100000002ULL, 0x200000000ULL, 0x100000002ULL },
+};
+
+static void write_sync(void *map, bool sync64, uint64_t value)
+{
+	if (sync64)
+		*(volatile uint64_t *)map = value;
+	else
+		*(volatile uint32_t *)map = value;
+}
+
+/*
+ * Emit a stream that sets the started flag and then waits on the sync object
+ * at SYNC_VA.
+ */
+static int emit_syncwait(uint64_t *instrs, const struct syncwait_case *c)
+{
+	int k = 0;
+
+	instrs[k++] = cs_mov48(8, INITIAL_VA + STARTED_OFFSET);
+	instrs[k++] = cs_mov32(6, 1);
+	instrs[k++] = cs_sync_set32(8, 6);
+	instrs[k++] = cs_mov48(0, SYNC_VA);
+
+	if (c->sync64) {
+		instrs[k++] = cs_mov48(2, c->ref);
+		instrs[k++] = cs_sync_wait64(0, 2, c->condition);
+	} else {
+		instrs[k++] = cs_mov32(2, c->ref);
+		instrs[k++] = cs_sync_wait32(0, 2, c->condition);
+	}
+
+	return k;
+}
+
+static void wait_started(volatile uint32_t *started)
+{
+	int retries = 100;
+
+	while (*started == 0 && retries--)
+		usleep(10000);
+	igt_assert_f(*started != 0, "the waiting job failed to start\n");
+}
+
+/*
+ * Push the group of a job blocked on a sync wait off its slot with a counted
+ * loop on every slot at a higher priority, check that the job stays blocked,
+ * then release the sync object from the CPU. The CPU write raises no event,
+ * so a short job queued behind one of the loops makes the driver look at the
+ * wait again once it is done.
+ */
+static void release_offslot(int fd, uint32_t waiter, void *sync,
+			    const struct syncwait_case *c)
+{
+	struct drm_panthor_queue_create queue = {
+		.priority = 0, .ringbuf_size = 4096,
+	};
+	uint32_t *groups = calloc(g_slots, sizeof(*groups));
+	uint32_t *syncobjs = calloc(g_slots, sizeof(*syncobjs));
+	struct drm_panthor_group_create cfg;
+	struct drm_panthor_sync_op sync_op;
+	struct panthor_bo bo = {};
+	uint64_t instrs[16];
+	uint32_t vm_id, kick;
+	int ninstrs, nkick;
+	int status;
+
+	igt_assert(groups && syncobjs);
+
+	igt_panthor_vm_create(fd, &vm_id, 0);
+	igt_panthor_bo_create_mapped(fd, &bo, 4096, 0, 0);
+
+	ninstrs = emit_counted_loop(instrs, INITIAL_VA + COUNTER_OFFSET, 0,
+				    COUNTED_LOOP_N);
+	memcpy(bo.map, instrs, ninstrs * sizeof(instrs[0]));
+
+	/* The short job the release needs, after the loop in the same BO. */
+	nkick = emit_counted_loop(instrs, INITIAL_VA + COUNTER_OFFSET, 0, 1);
+	memcpy((uint8_t *)bo.map + 512, instrs, nkick * sizeof(instrs[0]));
+
+	igt_panthor_vm_bind(fd, vm_id, bo.handle, INITIAL_VA, bo.size,
+			    DRM_PANTHOR_VM_BIND_OP_TYPE_MAP |
+			    DRM_PANTHOR_VM_BIND_OP_MAP_UNCACHED, 0);
+
+	for (uint32_t i = 0; i < g_slots; i++) {
+		cfg = make_group_cfg(&queue, 1, PANTHOR_GROUP_PRIORITY_MEDIUM,
+				     vm_id);
+		igt_panthor_group_create(fd, &cfg, 0);
+		groups[i] = cfg.group_handle;
+
+		syncobjs[i] = syncobj_create(fd, 0);
+		sync_op = signal_op(syncobjs[i]);
+		submit_stream(fd, groups[i], 0, INITIAL_VA,
+			      ninstrs * sizeof(instrs[0]), &sync_op, 1);
+	}
+
+	igt_assert_f(!wait_done(fd, waiter, SEC_NS / 2),
+		     "the job passed an unsatisfied %s wait\n", c->name);
+
+	write_sync(sync, c->sync64, c->released);
+
+	kick = syncobj_create(fd, 0);
+	sync_op = signal_op(kick);
+	submit_stream(fd, groups[0], 0, INITIAL_VA + 512,
+		      nkick * sizeof(instrs[0]), &sync_op, 1);
+
+	igt_assert_f(wait_done(fd, waiter, 5 * SEC_NS),
+		     "the released %s wait never completed\n", c->name);
+	status = fence_status(fd, waiter);
+	igt_assert_f(status == 1, "the waiting job failed (fence status %d)\n",
+		     status);
+
+	igt_assert(wait_done(fd, kick, 10 * SEC_NS));
+	for (uint32_t i = 0; i < g_slots; i++)
+		igt_assert_f(wait_done(fd, syncobjs[i], 10 * SEC_NS),
+			     "busy group %u timed out\n", i);
+
+	syncobj_destroy(fd, kick);
+	for (uint32_t i = 0; i < g_slots; i++) {
+		igt_panthor_group_destroy(fd, groups[i], 0);
+		syncobj_destroy(fd, syncobjs[i]);
+	}
+	igt_panthor_free_bo(fd, &bo);
+	igt_panthor_vm_destroy(fd, vm_id, 0);
+	free(groups);
+	free(syncobjs);
 }
 
 int igt_main()
@@ -1591,6 +1750,141 @@ int igt_main()
 
 		syncobj_destroy(fd, syncobj);
 		igt_panthor_free_bo(fd, &bo);
+		igt_panthor_vm_destroy(fd, vm_id, 0);
+	}
+
+	for (int i = 0; i < ARRAY_SIZE(syncwait_cases); i++) {
+		const struct syncwait_case *c = &syncwait_cases[i];
+
+		igt_describe_f("A %s sync wait holds while its group is off "
+			       "its slot, and the job completes once the CPU "
+			       "releases the sync object.", c->name);
+		igt_subtest_f("sync_wait_offslot_%s", c->name) {
+			struct drm_panthor_queue_create queue = {
+				.priority = 0, .ringbuf_size = 4096,
+			};
+			struct panthor_bo code = {}, sync = {};
+			struct drm_panthor_group_create cfg;
+			struct drm_panthor_sync_op sync_op;
+			volatile uint32_t *started;
+			uint32_t vm_id, syncobj;
+			uint64_t instrs[8];
+			int ninstrs;
+
+			igt_panthor_vm_create(fd, &vm_id, 0);
+			igt_panthor_bo_create_mapped(fd, &code, 4096, 0, 0);
+			igt_panthor_bo_create_mapped(fd, &sync, 4096, 0, 0);
+
+			started = (volatile uint32_t *)((uint8_t *)code.map +
+							STARTED_OFFSET);
+			*started = 0;
+			write_sync(sync.map, c->sync64, c->blocked);
+
+			ninstrs = emit_syncwait(instrs, c);
+			memcpy(code.map, instrs, ninstrs * sizeof(instrs[0]));
+
+			igt_panthor_vm_bind(fd, vm_id, code.handle, INITIAL_VA,
+					    code.size,
+					    DRM_PANTHOR_VM_BIND_OP_TYPE_MAP |
+					    DRM_PANTHOR_VM_BIND_OP_MAP_UNCACHED, 0);
+			igt_panthor_vm_bind(fd, vm_id, sync.handle, SYNC_VA,
+					    sync.size,
+					    DRM_PANTHOR_VM_BIND_OP_TYPE_MAP |
+					    DRM_PANTHOR_VM_BIND_OP_MAP_UNCACHED, 0);
+
+			cfg = make_group_cfg(&queue, 1,
+					     PANTHOR_GROUP_PRIORITY_LOW, vm_id);
+			igt_panthor_group_create(fd, &cfg, 0);
+
+			syncobj = syncobj_create(fd, 0);
+			sync_op = signal_op(syncobj);
+			submit_stream(fd, cfg.group_handle, 0, INITIAL_VA,
+				      ninstrs * sizeof(instrs[0]), &sync_op, 1);
+
+			wait_started(started);
+			release_offslot(fd, syncobj, sync.map, c);
+
+			syncobj_destroy(fd, syncobj);
+			igt_panthor_group_destroy(fd, cfg.group_handle, 0);
+			igt_panthor_free_bo(fd, &sync);
+			igt_panthor_free_bo(fd, &code);
+			igt_panthor_vm_destroy(fd, vm_id, 0);
+		}
+	}
+
+	igt_describe("After an off-slot sync wait is satisfied, a new wait at "
+		     "the same address reads the BO mapped there now, not the "
+		     "one the first wait resolved.");
+	igt_subtest("sync_wait_offslot_remap") {
+		const struct syncwait_case *c = &syncwait_cases[0];
+		struct drm_panthor_queue_create queue = {
+			.priority = 0, .ringbuf_size = 4096,
+		};
+		struct panthor_bo code = {}, first = {}, second = {};
+		struct drm_panthor_group_create cfg;
+		struct drm_panthor_sync_op sync_op;
+		volatile uint32_t *started;
+		uint32_t vm_id, syncobj;
+		uint64_t instrs[8];
+		int ninstrs;
+
+		igt_panthor_vm_create(fd, &vm_id, 0);
+		igt_panthor_bo_create_mapped(fd, &code, 4096, 0, 0);
+		igt_panthor_bo_create_mapped(fd, &first, 4096, 0, 0);
+		igt_panthor_bo_create_mapped(fd, &second, 4096, 0, 0);
+
+		started = (volatile uint32_t *)((uint8_t *)code.map +
+						STARTED_OFFSET);
+		*started = 0;
+		write_sync(first.map, c->sync64, c->blocked);
+		write_sync(second.map, c->sync64, c->blocked);
+
+		ninstrs = emit_syncwait(instrs, c);
+		memcpy(code.map, instrs, ninstrs * sizeof(instrs[0]));
+
+		igt_panthor_vm_bind(fd, vm_id, code.handle, INITIAL_VA,
+				    code.size,
+				    DRM_PANTHOR_VM_BIND_OP_TYPE_MAP |
+				    DRM_PANTHOR_VM_BIND_OP_MAP_UNCACHED, 0);
+		igt_panthor_vm_bind(fd, vm_id, first.handle, SYNC_VA,
+				    first.size,
+				    DRM_PANTHOR_VM_BIND_OP_TYPE_MAP |
+				    DRM_PANTHOR_VM_BIND_OP_MAP_UNCACHED, 0);
+
+		cfg = make_group_cfg(&queue, 1, PANTHOR_GROUP_PRIORITY_LOW,
+				     vm_id);
+		igt_panthor_group_create(fd, &cfg, 0);
+
+		syncobj = syncobj_create(fd, 0);
+		sync_op = signal_op(syncobj);
+		submit_stream(fd, cfg.group_handle, 0, INITIAL_VA,
+			      ninstrs * sizeof(instrs[0]), &sync_op, 1);
+		wait_started(started);
+		release_offslot(fd, syncobj, first.map, c);
+
+		/*
+		 * Put a BO whose sync object still blocks at the same address,
+		 * and drop the first one, which would satisfy the wait.
+		 */
+		igt_panthor_vm_bind(fd, vm_id, 0, SYNC_VA, first.size,
+				    DRM_PANTHOR_VM_BIND_OP_TYPE_UNMAP, 0);
+		igt_panthor_free_bo(fd, &first);
+		igt_panthor_vm_bind(fd, vm_id, second.handle, SYNC_VA,
+				    second.size,
+				    DRM_PANTHOR_VM_BIND_OP_TYPE_MAP |
+				    DRM_PANTHOR_VM_BIND_OP_MAP_UNCACHED, 0);
+
+		*started = 0;
+		sync_op = signal_op(syncobj);
+		submit_stream(fd, cfg.group_handle, 0, INITIAL_VA,
+			      ninstrs * sizeof(instrs[0]), &sync_op, 1);
+		wait_started(started);
+		release_offslot(fd, syncobj, second.map, c);
+
+		syncobj_destroy(fd, syncobj);
+		igt_panthor_group_destroy(fd, cfg.group_handle, 0);
+		igt_panthor_free_bo(fd, &second);
+		igt_panthor_free_bo(fd, &code);
 		igt_panthor_vm_destroy(fd, vm_id, 0);
 	}
 
