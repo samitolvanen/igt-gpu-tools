@@ -38,12 +38,15 @@
 /* Relative wait budget in nanoseconds. */
 #define SEC_NS		1000000000ULL
 
-/*
- * Iteration count for one job. A Mali-G610 runs 100k iterations in about
- * 0.73 s with devfreq active and about 1.5x slower at its lowest OPP, so one
- * job takes about 0.45 s, well under the driver's 5 s job timeout.
- */
+/* Iteration count of the first calibration job. */
 #define DEVFREQ_LOOP_N	40000
+
+/*
+ * Run time of one job. The queued jobs outlast the 100 ms pump interval even
+ * if the frequency rises well above the one the test calibrated at, and one
+ * job stays well under the driver's 5 s job timeout.
+ */
+#define DEVFREQ_JOB_NS	(250 * 1000000ULL)
 
 /* Jobs kept queued back to back to sustain the load. */
 #define DEVFREQ_JOBS	3
@@ -51,6 +54,9 @@
 /* GPU core masks, queried once in the top fixture. */
 static uint64_t g_shader_present;
 static uint64_t g_tiler_present;
+
+/* Iteration count of one job, calibrated on the first workload. */
+static uint32_t g_loop_n;
 
 static int64_t abs_timeout(int64_t rel_ns)
 {
@@ -311,9 +317,22 @@ struct workload {
 	uint32_t syncobjs[DEVFREQ_JOBS];
 	unsigned int submitted;
 	unsigned int retired;
+	uint32_t loop_n;
 	uint64_t stream_size;
 	struct panthor_bo bo;
 };
+
+/* Write the job's command stream for a loop of n iterations. */
+static void write_stream(struct workload *w, uint32_t n)
+{
+	uint64_t instrs[16];
+	int ninstrs;
+
+	ninstrs = emit_counted_loop(instrs, INITIAL_VA + COUNTER_OFFSET, n);
+	memcpy(w->bo.map, instrs, ninstrs * sizeof(instrs[0]));
+	w->stream_size = ninstrs * sizeof(instrs[0]);
+	w->loop_n = n;
+}
 
 static void submit_job(int fd, struct workload *w)
 {
@@ -357,14 +376,42 @@ static void pump_workload(int fd, struct workload *w)
 		submit_job(fd, w);
 }
 
+/*
+ * Size one job to run for about DEVFREQ_JOB_NS on this GPU. Each calibration
+ * job runs alone, and the count doubles until one runs for a quarter of that
+ * time, so the submit latency is small next to the measured run time.
+ */
+static void calibrate_workload(int fd, struct workload *w)
+{
+	uint64_t n = DEVFREQ_LOOP_N;
+	int64_t start, ns;
+
+	for (;;) {
+		write_stream(w, n);
+		start = abs_timeout(0);
+		submit_job(fd, w);
+		igt_assert_f(wait_done(fd, w->syncobjs[w->retired % DEVFREQ_JOBS],
+				       10 * SEC_NS),
+			     "calibration job did not signal\n");
+		ns = abs_timeout(0) - start;
+		retire_job(fd, w);
+		if (ns >= DEVFREQ_JOB_NS / 4 || n > UINT32_MAX / 2)
+			break;
+		n *= 2;
+	}
+
+	n = n * DEVFREQ_JOB_NS / ns;
+	g_loop_n = n < UINT32_MAX ? n : UINT32_MAX;
+	igt_info("calibration job took %lld us, using %u iterations per job\n",
+		 (long long)ns / 1000, g_loop_n);
+}
+
 static void submit_long_workload(int fd, struct workload *w)
 {
 	struct drm_panthor_queue_create queue = {
 		.priority = 0, .ringbuf_size = 4096,
 	};
 	struct drm_panthor_group_create cfg;
-	uint64_t instrs[16];
-	int ninstrs;
 
 	igt_panthor_vm_create(fd, &w->vm_id, 0);
 	for (int i = 0; i < DEVFREQ_JOBS; i++)
@@ -373,11 +420,6 @@ static void submit_long_workload(int fd, struct workload *w)
 
 	*(volatile uint32_t *)((uint8_t *)w->bo.map + COUNTER_OFFSET) = 0;
 
-	ninstrs = emit_counted_loop(instrs, INITIAL_VA + COUNTER_OFFSET,
-				    DEVFREQ_LOOP_N);
-	memcpy(w->bo.map, instrs, ninstrs * sizeof(instrs[0]));
-	w->stream_size = ninstrs * sizeof(instrs[0]);
-
 	igt_panthor_vm_bind(fd, w->vm_id, w->bo.handle, INITIAL_VA, w->bo.size,
 			    DRM_PANTHOR_VM_BIND_OP_TYPE_MAP |
 			    DRM_PANTHOR_VM_BIND_OP_MAP_UNCACHED, 0);
@@ -385,6 +427,10 @@ static void submit_long_workload(int fd, struct workload *w)
 	cfg = make_group_cfg(&queue, 1, PANTHOR_GROUP_PRIORITY_LOW, w->vm_id);
 	igt_panthor_group_create(fd, &cfg, 0);
 	w->group_handle = cfg.group_handle;
+
+	if (!g_loop_n)
+		calibrate_workload(fd, w);
+	write_stream(w, g_loop_n);
 
 	pump_workload(fd, w);
 }
@@ -405,8 +451,8 @@ static void finish_workload(int fd, struct workload *w)
 
 	igt_assert_eq_u32(*(volatile uint32_t *)((uint8_t *)w->bo.map +
 						 COUNTER_OFFSET),
-			  DEVFREQ_LOOP_N);
-	igt_info("ran %u jobs of %u iterations\n", w->retired, DEVFREQ_LOOP_N);
+			  w->loop_n);
+	igt_info("ran %u jobs of %u iterations\n", w->retired, w->loop_n);
 }
 
 static void teardown_workload(int fd, struct workload *w)
