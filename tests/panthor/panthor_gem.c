@@ -70,6 +70,35 @@ static bool has_wb_mmap(int fd)
 	return supported;
 }
 
+/* PANTHOR_BO_LABEL_MAXLEN: the longest label, counting its NUL. */
+#define LABEL_MAXLEN 4096
+
+/*
+ * Issue a BO_SET_LABEL and return the raw ioctl result (0 on success, -1 on
+ * failure with errno set).
+ */
+static int set_label(int fd, uint32_t handle, const char *label)
+{
+	struct drm_panthor_bo_set_label args = {
+		.handle = handle,
+		.label = to_user_pointer(label),
+	};
+
+	return igt_ioctl(fd, DRM_IOCTL_PANTHOR_BO_SET_LABEL, &args);
+}
+
+/* A string of len copies of c, NUL-terminated. */
+static char *make_label(size_t len, char c)
+{
+	char *label = malloc(len + 1);
+
+	igt_assert(label);
+	memset(label, c, len);
+	label[len] = '\0';
+
+	return label;
+}
+
 int igt_main() {
 	int fd = -1;
 
@@ -388,6 +417,89 @@ int igt_main() {
 		igt_require(has_wb_mmap(fd));
 
 		do_ioctl_err(fd, DRM_IOCTL_PANTHOR_BO_CREATE, &args, EINVAL);
+	}
+
+	igt_describe("Set, replace and clear the label of a buffer object");
+	igt_subtest("bo_set_label") {
+		struct panthor_bo bo;
+		char *label;
+
+		igt_panthor_require_uapi_minor(fd, 4);
+		igt_panthor_bo_create(fd, &bo, PAGE_SIZE, 0, 0);
+
+		igt_assert_eq(set_label(fd, bo.handle, "igt-first"), 0);
+		igt_assert_eq(set_label(fd, bo.handle, "igt-second"), 0);
+
+		/* A NULL pointer clears the label, an empty string is a label. */
+		igt_assert_eq(set_label(fd, bo.handle, NULL), 0);
+		igt_assert_eq(set_label(fd, bo.handle, NULL), 0);
+		igt_assert_eq(set_label(fd, bo.handle, ""), 0);
+
+		/* The longest label fills the limit, NUL included. */
+		label = make_label(LABEL_MAXLEN - 1, 'a');
+		igt_assert_eq(set_label(fd, bo.handle, label), 0);
+		free(label);
+
+		/* Close the BO with a label still set. */
+		igt_panthor_free_bo(fd, &bo);
+	}
+
+	igt_describe("Reject BO_SET_LABEL with a label past the length limit, a "
+		     "bad handle, a bad label pointer or a nonzero pad");
+	igt_subtest("bo_set_label_validation") {
+		struct drm_panthor_bo_set_label args;
+		size_t page = getpagesize();
+		struct panthor_bo bo;
+		char *label, *map;
+
+		igt_panthor_require_uapi_minor(fd, 4);
+		igt_panthor_bo_create(fd, &bo, PAGE_SIZE, 0, 0);
+
+		/* One byte past the limit is rejected with E2BIG. */
+		label = make_label(LABEL_MAXLEN, 'a');
+		igt_assert_eq(set_label(fd, bo.handle, label), -1);
+		igt_assert_eq(errno, E2BIG);
+		free(label);
+
+		label = make_label(2 * LABEL_MAXLEN, 'a');
+		igt_assert_eq(set_label(fd, bo.handle, label), -1);
+		igt_assert_eq(errno, E2BIG);
+		free(label);
+
+		/* An unknown handle is rejected with ENOENT. */
+		igt_assert_eq(set_label(fd, 0xdeadbeef, "igt"), -1);
+		igt_assert_eq(errno, ENOENT);
+
+		/* A nonzero pad is rejected with EINVAL. */
+		args = (struct drm_panthor_bo_set_label){
+			.handle = bo.handle,
+			.pad = 1,
+			.label = to_user_pointer("igt"),
+		};
+		do_ioctl_err(fd, DRM_IOCTL_PANTHOR_BO_SET_LABEL, &args, EINVAL);
+
+		/*
+		 * A label in an unmapped page, and one that runs into an
+		 * unmapped page before its NUL, are rejected with EFAULT.
+		 */
+		map = mmap(NULL, 2 * page, PROT_READ | PROT_WRITE,
+			   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		igt_assert(map != MAP_FAILED);
+		igt_assert_eq(munmap(map + page, page), 0);
+
+		igt_assert_eq(set_label(fd, bo.handle, map + page), -1);
+		igt_assert_eq(errno, EFAULT);
+
+		memset(map + page - 16, 'a', 16);
+		igt_assert_eq(set_label(fd, bo.handle, map + page - 16), -1);
+		igt_assert_eq(errno, EFAULT);
+
+		munmap(map, page);
+
+		/* The rejected calls left the BO usable. */
+		igt_assert_eq(set_label(fd, bo.handle, "igt"), 0);
+
+		igt_panthor_free_bo(fd, &bo);
 	}
 
 	igt_fixture() {
