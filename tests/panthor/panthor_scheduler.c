@@ -1652,8 +1652,8 @@ int igt_main()
 	}
 
 	igt_describe("Unbind a range a running counted loop writes to and "
-		     "verify the unbind is accepted, the job resolves either "
-		     "way, and the VM still takes new work.");
+		     "verify the unbind is accepted, the job fails on the "
+		     "missing range, and the VM still takes new work.");
 	igt_subtest("unbind_active_range") {
 		uint32_t vm_id, group_handle, syncobj;
 		struct panthor_bo bo = {};
@@ -1662,26 +1662,29 @@ int igt_main()
 		};
 		struct drm_panthor_group_create cfg;
 		struct drm_panthor_sync_op sync;
-		volatile uint32_t *started;
+		volatile uint32_t *started, *counter;
 		uint64_t instrs[16];
-		int ninstrs, retries;
+		uint32_t count;
+		int ninstrs, status;
 
 		igt_panthor_vm_create(fd, &vm_id, 0);
 		syncobj = syncobj_create(fd, 0);
 		igt_panthor_bo_create_mapped(fd, &bo, 4096, 0, 0);
 
 		started = (volatile uint32_t *)((uint8_t *)bo.map + STARTED_OFFSET);
+		counter = (volatile uint32_t *)((uint8_t *)bo.map + COUNTER_OFFSET);
 		*started = 0;
-		*(volatile uint32_t *)((uint8_t *)bo.map + COUNTER_OFFSET) = 0;
+		*counter = 0;
 
 		/*
 		 * The loop runs from INITIAL_VA and writes through the second
 		 * mapping, so unbinding DATA_VA takes the data away while the
-		 * instructions stay mapped.
+		 * instructions stay mapped. It cannot finish before the job
+		 * timeout.
 		 */
 		ninstrs = emit_counted_loop(instrs, DATA_VA + COUNTER_OFFSET,
 					    DATA_VA + STARTED_OFFSET,
-					    COUNTED_LOOP_N);
+					    UINT32_MAX);
 		memcpy(bo.map, instrs, ninstrs * sizeof(instrs[0]));
 
 		igt_panthor_vm_bind(fd, vm_id, bo.handle, INITIAL_VA, bo.size,
@@ -1699,20 +1702,23 @@ int igt_main()
 		submit_stream(fd, group_handle, 0, INITIAL_VA,
 			      ninstrs * sizeof(instrs[0]), &sync, 1);
 
-		retries = 1000;
-		while (*started == 0 && retries--)
-			usleep(10000);
-		igt_assert_f(*started != 0, "the job failed to start\n");
+		igt_assert_f(wait_flag(started, SEC_NS),
+			     "the job failed to start\n");
 
 		igt_panthor_vm_bind(fd, vm_id, 0, DATA_VA, bo.size,
 				    DRM_PANTHOR_VM_BIND_OP_TYPE_UNMAP, 0);
 
 		/*
-		 * The loop either finishes or faults on the range that went
-		 * away. Both outcomes retire the fence.
+		 * Only the fault on the range that went away can end the loop
+		 * this soon, well before the job timeout.
 		 */
-		igt_assert_f(wait_done(fd, syncobj, 20 * SEC_NS),
+		igt_assert_f(wait_done(fd, syncobj, 2 * SEC_NS),
 			     "the job never retired after the unbind\n");
+		status = fence_status(fd, syncobj);
+		igt_assert_f(status < 0, "the job reported status %d\n", status);
+		count = *counter;
+		usleep(10000);
+		igt_assert_eq_u32(*counter, count);
 
 		igt_assert_eq_u32(vm_state(fd, vm_id),
 				  DRM_PANTHOR_VM_STATE_USABLE);
