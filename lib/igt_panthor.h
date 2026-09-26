@@ -72,6 +72,7 @@ enum cs_opcode {
 	CS_OPCODE_FLUSH_CACHE = 36,
 	CS_OPCODE_SYNC_SET32 = 38,
 	CS_OPCODE_SYNC_WAIT32 = 39,
+	CS_OPCODE_SYNC_WAIT64 = 53,
 };
 
 enum cs_flush_mode {
@@ -83,6 +84,7 @@ enum cs_flush_mode {
 
 /* Condition codes for BRANCH and SYNC_WAIT operations. */
 enum cs_condition {
+	CS_CONDITION_LE = 0,
 	CS_CONDITION_GT = 1,
 	CS_CONDITION_EQ = 2,
 };
@@ -178,6 +180,14 @@ struct cs_instr {
 			uint64_t unused1: 8;
 			uint64_t opcode: 8;
 		} sync_wait32;
+		struct {
+			uint64_t unused0: 28;
+			uint64_t condition: 4;
+			uint64_t val: 8;
+			uint64_t address: 8;
+			uint64_t unused1: 8;
+			uint64_t opcode: 8;
+		} sync_wait64;
 		uint64_t raw;
 	};
 };
@@ -353,6 +363,25 @@ cs_sync_wait32(uint8_t address, uint8_t val, enum cs_condition condition)
 	struct cs_instr instr = {
 		.sync_wait32 = {
 			.opcode = CS_OPCODE_SYNC_WAIT32,
+			.address = address,
+			.val = val,
+			.condition = condition,
+		},
+	};
+
+	return instr.raw;
+}
+
+/*
+ * Wait until the 64-bit sync object at the address in the @address register
+ * pair meets @condition against the value in the @val register pair.
+ */
+static inline uint64_t
+cs_sync_wait64(uint8_t address, uint8_t val, enum cs_condition condition)
+{
+	struct cs_instr instr = {
+		.sync_wait64 = {
+			.opcode = CS_OPCODE_SYNC_WAIT64,
 			.address = address,
 			.val = val,
 			.condition = condition,
