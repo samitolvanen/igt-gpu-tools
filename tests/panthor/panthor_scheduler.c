@@ -1267,155 +1267,53 @@ int igt_main()
 		assert_no_wedge(kmsg_fd);
 	}
 
-	igt_describe("Fill every slot with busy high-priority counted loops, "
-		     "then submit a realtime group and verify it preempts and "
-		     "finishes first.");
+	igt_describe("Fill every slot with high-priority counted loops that only "
+		     "a group destroy can end, then submit a realtime group and "
+		     "verify it takes a slot, finishes its loop first, and the "
+		     "group it preempted resumes.");
 	igt_subtest("rt_priority_preemption") {
 		uint32_t n = g_slots;
-		uint32_t *vm_ids = calloc(n + 1, sizeof(*vm_ids));
-		uint32_t *groups = calloc(n + 1, sizeof(*groups));
-		uint32_t *syncobjs = calloc(n + 1, sizeof(*syncobjs));
-		struct panthor_bo *bos = calloc(n + 1, sizeof(*bos));
-		uint32_t rt = n;
-		volatile uint32_t *rt_started, *rt_counter;
-		struct drm_panthor_group_create rt_cfg;
-		struct drm_panthor_queue_create rt_queue = {
-			.priority = 0, .ringbuf_size = 4096,
-		};
-		struct drm_panthor_sync_op rt_sync;
-		uint64_t rt_instrs[16];
-		int rt_ninstrs, retries;
-		bool created;
+		struct loop_group *g = calloc(n, sizeof(*g));
+		/* Short, so the background jobs stay clear of the job timeout. */
+		const uint32_t rt_n = COUNTED_LOOP_N / 10;
+		struct loop_group rt;
+		int status;
 
-		/* Fill all slots with busy HIGH priority groups. */
+		igt_assert(g);
+
+		/* HIGH priority needs CAP_SYS_NICE or DRM_MASTER. */
 		for (uint32_t i = 0; i < n; i++) {
-			struct drm_panthor_queue_create queue = {
-				.priority = 0, .ringbuf_size = 4096,
-			};
-			struct drm_panthor_group_create cfg;
-			struct drm_panthor_sync_op sync;
-			uint64_t instrs[16];
-			int ninstrs;
-
-			igt_panthor_vm_create(fd, &vm_ids[i], 0);
-			syncobjs[i] = syncobj_create(fd, 0);
-			igt_panthor_bo_create_mapped(fd, &bos[i], 4096, 0, 0);
-
-			*(volatile uint32_t *)((uint8_t *)bos[i].map + STARTED_OFFSET) = 0;
-			*(volatile uint32_t *)((uint8_t *)bos[i].map + COUNTER_OFFSET) = 0;
-
-			ninstrs = emit_counted_loop(instrs,
-						    INITIAL_VA + COUNTER_OFFSET,
-						    INITIAL_VA + STARTED_OFFSET,
-						    COUNTED_LOOP_N);
-			memcpy(bos[i].map, instrs, ninstrs * sizeof(instrs[0]));
-
-			igt_panthor_vm_bind(fd, vm_ids[i], bos[i].handle,
-					    INITIAL_VA, bos[i].size,
-					    DRM_PANTHOR_VM_BIND_OP_TYPE_MAP |
-					    DRM_PANTHOR_VM_BIND_OP_MAP_UNCACHED, 0);
-
-			cfg = make_group_cfg(&queue, 1,
-					     PANTHOR_GROUP_PRIORITY_HIGH, vm_ids[i]);
-
-			/*
-			 * HIGH priority needs CAP_SYS_NICE / DRM_MASTER. If the
-			 * first one is rejected, skip cleanly after tearing down
-			 * what was already allocated.
-			 */
-			if (igt_ioctl(fd, DRM_IOCTL_PANTHOR_GROUP_CREATE, &cfg)) {
-				for (uint32_t j = 0; j < i; j++) {
-					igt_panthor_group_destroy(fd, groups[j], 0);
-					syncobj_destroy(fd, syncobjs[j]);
-					igt_panthor_free_bo(fd, &bos[j]);
-					igt_panthor_vm_destroy(fd, vm_ids[j], 0);
-				}
-				syncobj_destroy(fd, syncobjs[i]);
-				igt_panthor_free_bo(fd, &bos[i]);
-				igt_panthor_vm_destroy(fd, vm_ids[i], 0);
-				free(vm_ids);
-				free(groups);
-				free(syncobjs);
-				free(bos);
+			if (!loop_group_start(fd, &g[i], PANTHOR_GROUP_PRIORITY_HIGH,
+					      UINT32_MAX)) {
+				loop_groups_destroy(fd, g, i);
+				free(g);
 				igt_skip("HIGH priority group create rejected "
 					 "(needs CAP_SYS_NICE/DRM_MASTER)\n");
 			}
-			groups[i] = cfg.group_handle;
-
-			sync = signal_op(syncobjs[i]);
-			submit_stream(fd, groups[i], 0, INITIAL_VA,
-				      ninstrs * sizeof(instrs[0]), &sync, 1);
 		}
+		wait_all_started(g, n);
 
-		/* Wait for every HIGH job to genuinely start. */
-		for (uint32_t i = 0; i < n; i++) {
-			volatile uint32_t *started =
-				(volatile uint32_t *)((uint8_t *)bos[i].map + STARTED_OFFSET);
+		/* Only preempting one of the background groups frees a slot. */
+		igt_assert(loop_group_start(fd, &rt, PANTHOR_GROUP_PRIORITY_REALTIME,
+					    rt_n));
+		igt_assert_f(wait_flag(rt.started, SEC_NS),
+			     "the RT job failed to start\n");
+		igt_assert_f(wait_done(fd, rt.syncobj, 2 * SEC_NS),
+			     "the RT job timed out\n");
+		status = fence_status(fd, rt.syncobj);
+		igt_assert_f(status == 1, "the RT job failed (fence status %d)\n",
+			     status);
+		igt_assert_eq_u32(*rt.counter, rt_n);
 
-			while (*started == 0)
-				usleep(10000);
-		}
+		for (uint32_t i = 0; i < n; i++)
+			igt_assert_f(!wait_done(fd, g[i].syncobj, 0),
+				     "background job %u ended before the RT job\n",
+				     i);
+		assert_all_progress(g, n);
 
-		/* Submit the RT group; it must preempt a busy background group. */
-		igt_panthor_vm_create(fd, &vm_ids[rt], 0);
-		syncobjs[rt] = syncobj_create(fd, 0);
-		igt_panthor_bo_create_mapped(fd, &bos[rt], 4096, 0, 0);
-
-		rt_started = (volatile uint32_t *)((uint8_t *)bos[rt].map + STARTED_OFFSET);
-		rt_counter = (volatile uint32_t *)((uint8_t *)bos[rt].map + COUNTER_OFFSET);
-		*rt_started = 0;
-		*rt_counter = 0;
-
-		rt_ninstrs = emit_counted_loop(rt_instrs,
-					       INITIAL_VA + COUNTER_OFFSET,
-					       INITIAL_VA + STARTED_OFFSET,
-					       COUNTED_LOOP_N);
-		memcpy(bos[rt].map, rt_instrs, rt_ninstrs * sizeof(rt_instrs[0]));
-		igt_panthor_vm_bind(fd, vm_ids[rt], bos[rt].handle, INITIAL_VA,
-				    bos[rt].size,
-				    DRM_PANTHOR_VM_BIND_OP_TYPE_MAP |
-				    DRM_PANTHOR_VM_BIND_OP_MAP_UNCACHED, 0);
-
-		rt_cfg = make_group_cfg(&rt_queue, 1,
-					PANTHOR_GROUP_PRIORITY_REALTIME, vm_ids[rt]);
-		created = igt_ioctl(fd, DRM_IOCTL_PANTHOR_GROUP_CREATE, &rt_cfg) == 0;
-		igt_assert(created);
-		groups[rt] = rt_cfg.group_handle;
-
-		rt_sync = signal_op(syncobjs[rt]);
-		submit_stream(fd, groups[rt], 0, INITIAL_VA,
-			      rt_ninstrs * sizeof(rt_instrs[0]), &rt_sync, 1);
-
-		retries = 100;
-		while (*rt_started == 0 && retries--)
-			usleep(10000);
-		igt_assert_f(*rt_started != 0, "RT job failed to start immediately\n");
-
-		/* The RT group must finish its loop before the background groups. */
-		igt_assert_f(wait_done(fd, syncobjs[rt], 15 * SEC_NS),
-			     "RT job timed out\n");
-		igt_assert_eq_u32(*rt_counter, COUNTED_LOOP_N);
-
-		/* Background groups must also drain with the full count. */
-		for (uint32_t i = 0; i < n; i++) {
-			volatile uint32_t *counter =
-				(volatile uint32_t *)((uint8_t *)bos[i].map + COUNTER_OFFSET);
-
-			igt_assert_f(wait_done(fd, syncobjs[i], 15 * SEC_NS),
-				     "background job %u timed out\n", i);
-			igt_assert_eq_u32(*counter, COUNTED_LOOP_N);
-		}
-
-		for (uint32_t i = 0; i <= n; i++) {
-			igt_panthor_group_destroy(fd, groups[i], 0);
-			syncobj_destroy(fd, syncobjs[i]);
-			igt_panthor_free_bo(fd, &bos[i]);
-			igt_panthor_vm_destroy(fd, vm_ids[i], 0);
-		}
-		free(vm_ids);
-		free(groups);
-		free(syncobjs);
-		free(bos);
+		loop_groups_destroy(fd, &rt, 1);
+		loop_groups_destroy(fd, g, n);
+		free(g);
 	}
 
 	igt_describe("Submit enough small no-op jobs to wrap the ring buffer and "
