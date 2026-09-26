@@ -196,6 +196,23 @@ static int do_async_bind_op(int fd, uint32_t vm_id,
 	return ret;
 }
 
+/*
+ * Issue a single VM_BIND op synchronously or through the bind queue, and
+ * check that the ioctl rejects it with EINVAL. An async op carries a signal
+ * syncobj, so that only the op itself can be at fault.
+ */
+static void assert_bind_einval(int fd, uint32_t vm_id,
+			       struct drm_panthor_vm_bind_op *op, bool async)
+{
+	int ret;
+
+	ret = async ? do_async_bind_op(fd, vm_id, op) :
+		      do_sync_bind_op(fd, vm_id, op);
+
+	igt_assert_eq(ret, -1);
+	igt_assert_eq(errno, EINVAL);
+}
+
 int igt_main() {
 	int fd = -1;
 
@@ -1344,6 +1361,247 @@ int igt_main() {
 
 		syncobj_destroy(fd, good);
 		syncobj_destroy(fd, bad);
+		igt_panthor_free_bo(fd, &bo);
+		igt_panthor_vm_destroy(fd, vm_id, 0);
+	}
+
+	igt_describe("A sync-only op carries nothing but its sync operations: "
+		     "flags, an address range, a BO and an empty sync array are "
+		     "all rejected");
+	igt_subtest("vm_bind_sync_only_validation") {
+		const uint32_t map_flags[] = {
+			DRM_PANTHOR_VM_BIND_OP_MAP_READONLY,
+			DRM_PANTHOR_VM_BIND_OP_MAP_NOEXEC,
+			DRM_PANTHOR_VM_BIND_OP_MAP_UNCACHED,
+		};
+		struct drm_panthor_vm_bind_op op;
+		struct drm_panthor_vm_bind bind;
+		struct drm_panthor_sync_op sync;
+		struct panthor_bo bo;
+		uint32_t vm_id, syncobj;
+
+		require_async_vm_bind(fd);
+
+		igt_panthor_vm_create(fd, &vm_id, 0);
+		igt_panthor_bo_create(fd, &bo, PAGE_SIZE, 0, 0);
+
+		/* A well-formed sync-only op is accepted and signals. */
+		syncobj = syncobj_create(fd, 0);
+		sync = signal_op(syncobj);
+		op = (struct drm_panthor_vm_bind_op){
+			.flags = DRM_PANTHOR_VM_BIND_OP_TYPE_SYNC_ONLY,
+			.syncs = DRM_PANTHOR_OBJ_ARRAY(1, &sync),
+		};
+		bind = (struct drm_panthor_vm_bind){
+			.vm_id = vm_id,
+			.flags = DRM_PANTHOR_VM_BIND_ASYNC,
+			.ops = DRM_PANTHOR_OBJ_ARRAY(1, &op),
+		};
+		do_ioctl(fd, DRM_IOCTL_PANTHOR_VM_BIND, &bind);
+		assert_completed(fd, syncobj, "sync-only op");
+		syncobj_destroy(fd, syncobj);
+
+		/* Map flags are rejected. */
+		for (int i = 0; i < ARRAY_SIZE(map_flags); i++) {
+			op = (struct drm_panthor_vm_bind_op){
+				.flags = DRM_PANTHOR_VM_BIND_OP_TYPE_SYNC_ONLY |
+					 map_flags[i],
+			};
+			assert_bind_einval(fd, vm_id, &op, true);
+		}
+
+		/* A VA, a size, or both are rejected. */
+		op = (struct drm_panthor_vm_bind_op){
+			.flags = DRM_PANTHOR_VM_BIND_OP_TYPE_SYNC_ONLY,
+			.va = TEST_VA,
+		};
+		assert_bind_einval(fd, vm_id, &op, true);
+
+		op = (struct drm_panthor_vm_bind_op){
+			.flags = DRM_PANTHOR_VM_BIND_OP_TYPE_SYNC_ONLY,
+			.size = PAGE_SIZE,
+		};
+		assert_bind_einval(fd, vm_id, &op, true);
+
+		op = (struct drm_panthor_vm_bind_op){
+			.flags = DRM_PANTHOR_VM_BIND_OP_TYPE_SYNC_ONLY,
+			.va = TEST_VA,
+			.size = PAGE_SIZE,
+		};
+		assert_bind_einval(fd, vm_id, &op, true);
+
+		/* A BO handle or a BO offset is rejected. */
+		op = (struct drm_panthor_vm_bind_op){
+			.flags = DRM_PANTHOR_VM_BIND_OP_TYPE_SYNC_ONLY,
+			.bo_handle = bo.handle,
+		};
+		assert_bind_einval(fd, vm_id, &op, true);
+
+		op = (struct drm_panthor_vm_bind_op){
+			.flags = DRM_PANTHOR_VM_BIND_OP_TYPE_SYNC_ONLY,
+			.bo_offset = PAGE_SIZE,
+		};
+		assert_bind_einval(fd, vm_id, &op, true);
+
+		/* A sync-only op without any sync operation is rejected. */
+		op = (struct drm_panthor_vm_bind_op){
+			.flags = DRM_PANTHOR_VM_BIND_OP_TYPE_SYNC_ONLY,
+		};
+		bind = (struct drm_panthor_vm_bind){
+			.vm_id = vm_id,
+			.flags = DRM_PANTHOR_VM_BIND_ASYNC,
+			.ops = DRM_PANTHOR_OBJ_ARRAY(1, &op),
+		};
+		do_ioctl_err(fd, DRM_IOCTL_PANTHOR_VM_BIND, &bind, EINVAL);
+
+		/* A synchronous bind cannot run a sync-only op over a range. */
+		op = (struct drm_panthor_vm_bind_op){
+			.flags = DRM_PANTHOR_VM_BIND_OP_TYPE_SYNC_ONLY,
+			.va = TEST_VA,
+			.size = PAGE_SIZE,
+		};
+		assert_bind_einval(fd, vm_id, &op, false);
+
+		igt_assert_eq_u32(vm_state(fd, vm_id),
+				  DRM_PANTHOR_VM_STATE_USABLE);
+
+		igt_panthor_free_bo(fd, &bo);
+		igt_panthor_vm_destroy(fd, vm_id, 0);
+	}
+
+	for (int async = 0; async <= 1; async++) {
+		igt_describe_f("%s unmap op that names a BO, a BO offset or a "
+			       "map flag is rejected",
+			       async ? "An async" : "A synchronous");
+		igt_subtest_f("vm_unbind%s_validation", async ? "_async" : "") {
+			struct drm_panthor_vm_bind_op op;
+			struct panthor_bo bo;
+			uint32_t vm_id;
+
+			if (async)
+				require_async_vm_bind(fd);
+
+			igt_panthor_vm_create(fd, &vm_id, 0);
+			igt_panthor_bo_create(fd, &bo, PAGE_SIZE, 0, 0);
+			igt_panthor_vm_bind(fd, vm_id, bo.handle, TEST_VA,
+					    PAGE_SIZE,
+					    DRM_PANTHOR_VM_BIND_OP_TYPE_MAP, 0);
+
+			op = (struct drm_panthor_vm_bind_op){
+				.flags = DRM_PANTHOR_VM_BIND_OP_TYPE_UNMAP,
+				.bo_handle = bo.handle,
+				.va = TEST_VA,
+				.size = PAGE_SIZE,
+			};
+			assert_bind_einval(fd, vm_id, &op, async);
+
+			op = (struct drm_panthor_vm_bind_op){
+				.flags = DRM_PANTHOR_VM_BIND_OP_TYPE_UNMAP,
+				.bo_offset = PAGE_SIZE,
+				.va = TEST_VA,
+				.size = PAGE_SIZE,
+			};
+			assert_bind_einval(fd, vm_id, &op, async);
+
+			op = (struct drm_panthor_vm_bind_op){
+				.flags = DRM_PANTHOR_VM_BIND_OP_TYPE_UNMAP |
+					 DRM_PANTHOR_VM_BIND_OP_MAP_READONLY,
+				.va = TEST_VA,
+				.size = PAGE_SIZE,
+			};
+			assert_bind_einval(fd, vm_id, &op, async);
+
+			/* A well-formed unmap of the range still goes through. */
+			op = (struct drm_panthor_vm_bind_op){
+				.flags = DRM_PANTHOR_VM_BIND_OP_TYPE_UNMAP,
+				.va = TEST_VA,
+				.size = PAGE_SIZE,
+			};
+			igt_assert_eq(async ? do_async_bind_op(fd, vm_id, &op) :
+					      do_sync_bind_op(fd, vm_id, &op), 0);
+
+			igt_panthor_free_bo(fd, &bo);
+			igt_panthor_vm_destroy(fd, vm_id, 0);
+		}
+	}
+
+	for (int async = 0; async <= 1; async++) {
+		igt_describe_f("%s op of an unknown type is rejected",
+			       async ? "An async" : "A synchronous");
+		igt_subtest_f("vm_bind%s_op_type_invalid", async ? "_async" : "") {
+			const uint32_t types[] = {
+				3u << 28,
+				DRM_PANTHOR_VM_BIND_OP_TYPE_MASK,
+			};
+			struct drm_panthor_vm_bind_op op;
+			struct panthor_bo bo;
+			uint32_t vm_id;
+
+			if (async)
+				require_async_vm_bind(fd);
+
+			igt_panthor_vm_create(fd, &vm_id, 0);
+			igt_panthor_bo_create(fd, &bo, PAGE_SIZE, 0, 0);
+
+			for (int i = 0; i < ARRAY_SIZE(types); i++) {
+				op = (struct drm_panthor_vm_bind_op){
+					.flags = types[i],
+					.bo_handle = bo.handle,
+					.va = TEST_VA,
+					.size = PAGE_SIZE,
+				};
+				assert_bind_einval(fd, vm_id, &op, async);
+			}
+
+			/* The VM still takes a well-formed map. */
+			igt_panthor_vm_bind(fd, vm_id, bo.handle, TEST_VA,
+					    PAGE_SIZE,
+					    DRM_PANTHOR_VM_BIND_OP_TYPE_MAP, 0);
+
+			igt_panthor_free_bo(fd, &bo);
+			igt_panthor_vm_destroy(fd, vm_id, 0);
+		}
+	}
+
+	igt_describe("A synchronous VM_BIND rejects sync operations on every "
+		     "op type, including an op that would otherwise do nothing");
+	igt_subtest("vm_bind_sync_rejects_syncs") {
+		struct drm_panthor_vm_bind_op op;
+		struct drm_panthor_sync_op sync;
+		struct panthor_bo bo;
+		uint32_t vm_id, syncobj;
+
+		igt_panthor_vm_create(fd, &vm_id, 0);
+		igt_panthor_bo_create(fd, &bo, PAGE_SIZE, 0, 0);
+		syncobj = syncobj_create(fd, 0);
+		sync = signal_op(syncobj);
+
+		op = (struct drm_panthor_vm_bind_op){
+			.flags = DRM_PANTHOR_VM_BIND_OP_TYPE_UNMAP,
+			.va = TEST_VA,
+			.size = PAGE_SIZE,
+			.syncs = DRM_PANTHOR_OBJ_ARRAY(1, &sync),
+		};
+		assert_bind_einval(fd, vm_id, &op, false);
+
+		/* A zero-size op is a no-op, but not with syncs attached. */
+		op = (struct drm_panthor_vm_bind_op){
+			.flags = DRM_PANTHOR_VM_BIND_OP_TYPE_MAP,
+			.bo_handle = bo.handle,
+			.syncs = DRM_PANTHOR_OBJ_ARRAY(1, &sync),
+		};
+		assert_bind_einval(fd, vm_id, &op, false);
+
+		op = (struct drm_panthor_vm_bind_op){
+			.flags = DRM_PANTHOR_VM_BIND_OP_TYPE_SYNC_ONLY,
+			.syncs = DRM_PANTHOR_OBJ_ARRAY(1, &sync),
+		};
+		assert_bind_einval(fd, vm_id, &op, false);
+
+		/* None of the rejected ops touched the syncobj. */
+		igt_assert_eq(syncobj_wait_err(fd, &syncobj, 1, 0, 0), -EINVAL);
+
+		syncobj_destroy(fd, syncobj);
 		igt_panthor_free_bo(fd, &bo);
 		igt_panthor_vm_destroy(fd, vm_id, 0);
 	}
