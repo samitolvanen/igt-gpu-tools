@@ -19,6 +19,7 @@ benchmark_progs = [
 	'intel_upload_blit_small',
 	'kms_fb_stress',
 	'kms_vblank',
+	'panthor_kmd_bench',
 	'prime_lookup',
 	'vgem_mmap',
         'xe_blt',
