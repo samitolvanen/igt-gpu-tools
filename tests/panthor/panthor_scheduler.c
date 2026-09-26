@@ -265,6 +265,172 @@ static void run_fresh_group(int fd, uint32_t vm_id)
 	igt_panthor_free_bo(fd, &bo);
 }
 
+/* Poll a flag the GPU sets, every 100 us, for at most rel_ns. */
+static bool wait_flag(volatile uint32_t *flag, int64_t rel_ns)
+{
+	int64_t end = abs_timeout(rel_ns);
+
+	while (*flag == 0) {
+		if (abs_timeout(0) > end)
+			return false;
+		usleep(100);
+	}
+
+	return true;
+}
+
+/* A group on its own VM that runs one counted loop. */
+struct loop_group {
+	uint32_t vm_id, group_handle, syncobj;
+	struct panthor_bo bo;
+	volatile uint32_t *started, *counter;
+};
+
+/*
+ * Create a loop group and submit a loop of n iterations to it. Returns false
+ * if the kernel rejects the priority, with nothing left to free.
+ */
+static bool loop_group_start(int fd, struct loop_group *g, uint8_t priority,
+			     uint32_t n)
+{
+	struct drm_panthor_queue_create queue = {
+		.priority = 0, .ringbuf_size = 4096,
+	};
+	struct drm_panthor_group_create cfg;
+	struct drm_panthor_sync_op sync;
+	uint64_t instrs[16];
+	int ninstrs;
+
+	igt_panthor_vm_create(fd, &g->vm_id, 0);
+	igt_panthor_bo_create_mapped(fd, &g->bo, 4096, 0, 0);
+	g->started = (volatile uint32_t *)((uint8_t *)g->bo.map + STARTED_OFFSET);
+	g->counter = (volatile uint32_t *)((uint8_t *)g->bo.map + COUNTER_OFFSET);
+	*g->started = 0;
+	*g->counter = 0;
+
+	ninstrs = emit_counted_loop(instrs, INITIAL_VA + COUNTER_OFFSET,
+				    INITIAL_VA + STARTED_OFFSET, n);
+	memcpy(g->bo.map, instrs, ninstrs * sizeof(instrs[0]));
+	igt_panthor_vm_bind(fd, g->vm_id, g->bo.handle, INITIAL_VA, g->bo.size,
+			    DRM_PANTHOR_VM_BIND_OP_TYPE_MAP |
+			    DRM_PANTHOR_VM_BIND_OP_MAP_UNCACHED, 0);
+
+	cfg = make_group_cfg(&queue, 1, priority, g->vm_id);
+	if (igt_ioctl(fd, DRM_IOCTL_PANTHOR_GROUP_CREATE, &cfg)) {
+		igt_panthor_free_bo(fd, &g->bo);
+		igt_panthor_vm_destroy(fd, g->vm_id, 0);
+		return false;
+	}
+	g->group_handle = cfg.group_handle;
+
+	g->syncobj = syncobj_create(fd, 0);
+	sync = signal_op(g->syncobj);
+	submit_stream(fd, g->group_handle, 0, INITIAL_VA,
+		      ninstrs * sizeof(instrs[0]), &sync, 1);
+
+	return true;
+}
+
+static void wait_all_started(struct loop_group *g, uint32_t n)
+{
+	int64_t end = abs_timeout(3 * SEC_NS);
+
+	for (uint32_t i = 0; i < n; i++)
+		igt_assert_f(wait_flag(g[i].started, end - abs_timeout(0)),
+			     "job %u failed to start\n", i);
+}
+
+/*
+ * Wait until every counter has moved past the value it had on entry. A
+ * counter never goes back, even for a group that left its slot and came
+ * back.
+ */
+static void assert_all_progress(struct loop_group *g, uint32_t n)
+{
+	uint32_t *first = calloc(n, sizeof(*first));
+	uint32_t *last = calloc(n, sizeof(*last));
+	int64_t end = abs_timeout(2 * SEC_NS);
+	uint32_t stuck;
+
+	igt_assert(first && last);
+
+	for (uint32_t i = 0; i < n; i++)
+		first[i] = last[i] = *g[i].counter;
+
+	for (;;) {
+		stuck = n;
+		for (uint32_t i = 0; i < n; i++) {
+			uint32_t count = *g[i].counter;
+
+			igt_assert_f(count >= last[i],
+				     "job %u counter went back from %u to %u\n",
+				     i, last[i], count);
+			last[i] = count;
+			if (count == first[i] && stuck == n)
+				stuck = i;
+		}
+		if (stuck == n)
+			break;
+		igt_assert_f(abs_timeout(0) < end,
+			     "job %u made no progress\n", stuck);
+		usleep(100);
+	}
+
+	free(first);
+	free(last);
+}
+
+/*
+ * Destroy the groups of loops that only the destroy can end. Every job must
+ * then retire well before the job timeout, and its counter must stop.
+ */
+static void loop_groups_destroy(int fd, struct loop_group *g, uint32_t n)
+{
+	uint32_t *count = calloc(n, sizeof(*count));
+
+	igt_assert(count);
+
+	for (uint32_t i = 0; i < n; i++)
+		igt_panthor_group_destroy(fd, g[i].group_handle, 0);
+
+	for (uint32_t i = 0; i < n; i++) {
+		igt_assert_f(wait_done(fd, g[i].syncobj, 2 * SEC_NS),
+			     "job %u did not retire after the destroy\n", i);
+		count[i] = *g[i].counter;
+	}
+	usleep(10000);
+	for (uint32_t i = 0; i < n; i++) {
+		igt_assert_eq_u32(*g[i].counter, count[i]);
+		syncobj_destroy(fd, g[i].syncobj);
+		igt_panthor_free_bo(fd, &g[i].bo);
+		igt_panthor_vm_destroy(fd, g[i].vm_id, 0);
+	}
+
+	free(count);
+}
+
+/*
+ * Run n groups of loops that only a group destroy can end. A group can then
+ * start only on a slot no other group holds, or on one that time-slicing
+ * takes from another group. Every group must start and make progress.
+ */
+static void run_loop_groups(int fd, uint32_t n)
+{
+	struct loop_group *g = calloc(n, sizeof(*g));
+
+	igt_assert(g);
+
+	for (uint32_t i = 0; i < n; i++)
+		igt_assert(loop_group_start(fd, &g[i],
+					    PANTHOR_GROUP_PRIORITY_LOW,
+					    UINT32_MAX));
+	wait_all_started(g, n);
+	assert_all_progress(g, n);
+
+	loop_groups_destroy(fd, g, n);
+	free(g);
+}
+
 /*
  * Kernel log markers for a GPU reset, for a firmware handshake that timed
  * out, and for a job the scheduler had to kill. Only Tyr logs the reset
@@ -745,82 +911,11 @@ int igt_main()
 		igt_panthor_free_bo(fd, &bo);
 	}
 
-	igt_describe("Fill every CSG slot with a concurrent counted loop and "
-		     "verify each completes with the full iteration count.");
+	igt_describe("Fill every CSG slot with a counted loop that only a group "
+		     "destroy can end, and verify every group starts and all of "
+		     "them keep making progress.");
 	igt_subtest("csg_slots_max") {
-		uint32_t n = g_slots;
-		uint32_t *vm_ids = calloc(n, sizeof(*vm_ids));
-		uint32_t *groups = calloc(n, sizeof(*groups));
-		uint32_t *syncobjs = calloc(n, sizeof(*syncobjs));
-		struct panthor_bo *bos = calloc(n, sizeof(*bos));
-
-		for (uint32_t i = 0; i < n; i++) {
-			struct drm_panthor_queue_create queue = {
-				.priority = 0, .ringbuf_size = 4096,
-			};
-			struct drm_panthor_group_create cfg;
-			struct drm_panthor_sync_op sync;
-			uint64_t instrs[16];
-			int ninstrs;
-
-			igt_panthor_vm_create(fd, &vm_ids[i], 0);
-			syncobjs[i] = syncobj_create(fd, 0);
-			igt_panthor_bo_create_mapped(fd, &bos[i], 4096, 0, 0);
-
-			*(volatile uint32_t *)((uint8_t *)bos[i].map + STARTED_OFFSET) = 0;
-			*(volatile uint32_t *)((uint8_t *)bos[i].map + COUNTER_OFFSET) = 0;
-
-			ninstrs = emit_counted_loop(instrs,
-						    INITIAL_VA + COUNTER_OFFSET,
-						    INITIAL_VA + STARTED_OFFSET,
-						    COUNTED_LOOP_N);
-			memcpy(bos[i].map, instrs, ninstrs * sizeof(instrs[0]));
-
-			igt_panthor_vm_bind(fd, vm_ids[i], bos[i].handle,
-					    INITIAL_VA, bos[i].size,
-					    DRM_PANTHOR_VM_BIND_OP_TYPE_MAP |
-					    DRM_PANTHOR_VM_BIND_OP_MAP_UNCACHED, 0);
-
-			cfg = make_group_cfg(&queue, 1,
-					     PANTHOR_GROUP_PRIORITY_LOW, vm_ids[i]);
-			igt_panthor_group_create(fd, &cfg, 0);
-			groups[i] = cfg.group_handle;
-
-			sync = signal_op(syncobjs[i]);
-			submit_stream(fd, groups[i], 0, INITIAL_VA,
-				      ninstrs * sizeof(instrs[0]), &sync, 1);
-		}
-
-		/* With exactly g_slots groups, all stay resident and run. */
-		for (uint32_t i = 0; i < n; i++) {
-			volatile uint32_t *started =
-				(volatile uint32_t *)((uint8_t *)bos[i].map + STARTED_OFFSET);
-			int retries = 100;
-
-			while (*started == 0 && retries--)
-				usleep(10000);
-			igt_assert_f(*started != 0, "job %u failed to start\n", i);
-		}
-
-		for (uint32_t i = 0; i < n; i++) {
-			volatile uint32_t *counter =
-				(volatile uint32_t *)((uint8_t *)bos[i].map + COUNTER_OFFSET);
-
-			igt_assert_f(wait_done(fd, syncobjs[i], 10 * SEC_NS),
-				     "job %u timed out\n", i);
-			igt_assert_eq_u32(*counter, COUNTED_LOOP_N);
-		}
-
-		for (uint32_t i = 0; i < n; i++) {
-			igt_panthor_group_destroy(fd, groups[i], 0);
-			syncobj_destroy(fd, syncobjs[i]);
-			igt_panthor_free_bo(fd, &bos[i]);
-			igt_panthor_vm_destroy(fd, vm_ids[i], 0);
-		}
-		free(vm_ids);
-		free(groups);
-		free(syncobjs);
-		free(bos);
+		run_loop_groups(fd, g_slots);
 	}
 
 	igt_describe("Overcommit CSG slots by one and verify time-slicing lets "
