@@ -170,6 +170,25 @@ void igt_panthor_group_submit_simple(int fd, uint32_t group_handle,
  */
 
 /**
+ * igt_panthor_require_uapi_minor:
+ * @fd: device file descriptor
+ * @minor: uAPI minor version the caller needs
+ *
+ * Skip the calling test unless the driver reports uAPI 1.@minor or later.
+ * Each minor version adds ioctls or flags, so the version says which of them
+ * the driver implements.
+ */
+void igt_panthor_require_uapi_minor(int fd, int minor)
+{
+	struct drm_version version = {};
+
+	do_ioctl(fd, DRM_IOCTL_VERSION, &version);
+	igt_require_f(version.version_major == 1 && version.version_minor >= minor,
+		      "requires uAPI 1.%d, driver has %d.%d\n", minor,
+		      version.version_major, version.version_minor);
+}
+
+/**
  * igt_panthor_query:
  * @fd: device file descriptor
  * @type: query type (e.g., DRM_PANTHOR_DEV_QUERY_GPU_INFO)
