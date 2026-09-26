@@ -99,6 +99,24 @@ static char *make_label(size_t len, char c)
 	return label;
 }
 
+/*
+ * Query a BO with every output field preset to garbage, so that a field the
+ * driver leaves alone does not pass as zero.
+ */
+static struct drm_panthor_bo_query_info query_info(int fd, uint32_t handle)
+{
+	struct drm_panthor_bo_query_info info = {
+		.handle = handle,
+		.extra_flags = 0xdeadbeef,
+		.create_flags = 0xdeadbeef,
+		.pad = 0xdeadbeef,
+	};
+
+	do_ioctl(fd, DRM_IOCTL_PANTHOR_BO_QUERY_INFO, &info);
+
+	return info;
+}
+
 int igt_main() {
 	int fd = -1;
 
@@ -500,6 +518,102 @@ int igt_main() {
 		igt_assert_eq(set_label(fd, bo.handle, "igt"), 0);
 
 		igt_panthor_free_bo(fd, &bo);
+	}
+
+	igt_describe("BO_QUERY_INFO reports the flags a BO was created with, and "
+		     "no extra flags for a native BO");
+	igt_subtest("bo_query_info") {
+		const uint32_t create_flags[] = {
+			0,
+			DRM_PANTHOR_BO_NO_MMAP,
+			DRM_PANTHOR_BO_WB_MMAP,
+		};
+		struct drm_panthor_bo_query_info info;
+		struct panthor_bo bo;
+		uint32_t vm_id;
+
+		igt_panthor_require_uapi_minor(fd, 7);
+
+		for (int i = 0; i < ARRAY_SIZE(create_flags); i++) {
+			igt_panthor_bo_create(fd, &bo, PAGE_SIZE,
+					      create_flags[i], 0);
+
+			info = query_info(fd, bo.handle);
+			igt_assert_eq_u32(info.handle, bo.handle);
+			igt_assert_eq_u32(info.create_flags, create_flags[i]);
+			igt_assert_eq_u32(info.extra_flags, 0);
+			igt_assert_eq_u32(info.pad, 0);
+
+			igt_panthor_free_bo(fd, &bo);
+		}
+
+		/* A BO private to a VM reports no flags of its own. */
+		{
+			struct drm_panthor_bo_create args = {
+				.size = PAGE_SIZE,
+			};
+
+			igt_panthor_vm_create(fd, &vm_id, 0);
+			args.exclusive_vm_id = vm_id;
+			do_ioctl(fd, DRM_IOCTL_PANTHOR_BO_CREATE, &args);
+
+			info = query_info(fd, args.handle);
+			igt_assert_eq_u32(info.create_flags, 0);
+			igt_assert_eq_u32(info.extra_flags, 0);
+			igt_assert_eq_u32(info.pad, 0);
+
+			gem_close(fd, args.handle);
+			igt_panthor_vm_destroy(fd, vm_id, 0);
+		}
+	}
+
+	igt_describe("A BO shared through a dma-buf with another file "
+		     "descriptor of the same device reports its creation flags "
+		     "there, and is not flagged as imported");
+	igt_subtest("bo_query_info_prime") {
+		struct drm_panthor_bo_query_info info;
+		struct panthor_bo bo;
+		uint32_t handle;
+		int fd2, dmabuf;
+
+		igt_panthor_require_uapi_minor(fd, 7);
+
+		fd2 = drm_open_driver(DRIVER_PANTHOR);
+		igt_panthor_bo_create(fd, &bo, PAGE_SIZE,
+				      DRM_PANTHOR_BO_WB_MMAP, 0);
+
+		dmabuf = prime_handle_to_fd(fd, bo.handle);
+		handle = prime_fd_to_handle(fd2, dmabuf);
+		close(dmabuf);
+
+		info = query_info(fd2, handle);
+		igt_assert_eq_u32(info.create_flags, DRM_PANTHOR_BO_WB_MMAP);
+		igt_assert_eq_u32(info.extra_flags, 0);
+		igt_assert_eq_u32(info.pad, 0);
+
+		/* The exporter still sees the BO it created. */
+		info = query_info(fd, bo.handle);
+		igt_assert_eq_u32(info.create_flags, DRM_PANTHOR_BO_WB_MMAP);
+		igt_assert_eq_u32(info.extra_flags, 0);
+
+		gem_close(fd2, handle);
+		igt_panthor_free_bo(fd, &bo);
+		drm_close_driver(fd2);
+	}
+
+	igt_describe("BO_QUERY_INFO rejects an unknown handle");
+	igt_subtest("bo_query_info_invalid_handle") {
+		struct drm_panthor_bo_query_info info = {
+			.handle = 0xdeadbeef,
+		};
+
+		igt_panthor_require_uapi_minor(fd, 7);
+
+		do_ioctl_err(fd, DRM_IOCTL_PANTHOR_BO_QUERY_INFO, &info, ENOENT);
+
+		/* Handle 0 is never a valid GEM handle. */
+		info.handle = 0;
+		do_ioctl_err(fd, DRM_IOCTL_PANTHOR_BO_QUERY_INFO, &info, ENOENT);
 	}
 
 	igt_fixture() {
