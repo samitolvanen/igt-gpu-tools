@@ -497,13 +497,15 @@ int igt_main() {
 		do_ioctl_err(fd, DRM_IOCTL_PANTHOR_BO_SET_LABEL, &args, EINVAL);
 
 		/*
-		 * A label in an unmapped page, and one that runs into an
-		 * unmapped page before its NUL, are rejected with EFAULT.
+		 * A label in an unreadable page, and one that runs into an
+		 * unreadable page before its NUL, are rejected with EFAULT.
+		 * The page stays mapped PROT_NONE: an unmapped one could be
+		 * mapped again by the time of the ioctl.
 		 */
 		map = mmap(NULL, 2 * page, PROT_READ | PROT_WRITE,
 			   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 		igt_assert(map != MAP_FAILED);
-		igt_assert_eq(munmap(map + page, page), 0);
+		igt_assert_eq(mprotect(map + page, page, PROT_NONE), 0);
 
 		igt_assert_eq(set_label(fd, bo.handle, map + page), -1);
 		igt_assert_eq(errno, EFAULT);
@@ -512,7 +514,7 @@ int igt_main() {
 		igt_assert_eq(set_label(fd, bo.handle, map + page - 16), -1);
 		igt_assert_eq(errno, EFAULT);
 
-		munmap(map, page);
+		munmap(map, 2 * page);
 
 		/* The rejected calls left the BO usable. */
 		igt_assert_eq(set_label(fd, bo.handle, "igt"), 0);
