@@ -689,7 +689,7 @@ test_wait_snapshot(int fd, uint32_t test_flags)
 	wait.fd = fd;
 	wait.wait.handles = to_user_pointer(syncobjs);
 	wait.wait.count_handles = 2;
-	wait.wait.timeout_nsec = short_timeout();
+	wait.wait.timeout_nsec = gettime_ns() + NSECS_PER_SEC;
 	wait.wait.flags = flags_for_test_flags(test_flags);
 
 	igt_assert_eq(pthread_create(&thread, NULL, wait_thread_func, &wait), 0);
