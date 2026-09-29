@@ -377,14 +377,22 @@ static void pump_workload(int fd, struct workload *w)
 }
 
 /*
- * Size one job to run for about DEVFREQ_JOB_NS on this GPU. Each calibration
- * job runs alone, and the count doubles until one runs for a quarter of that
- * time, so the submit latency is small next to the measured run time.
+ * Size one job to run for about DEVFREQ_JOB_NS on this GPU. After an untimed
+ * warm-up job, each calibration job runs alone, and the count doubles until
+ * one runs for a quarter of that time, so the submit latency is small next to
+ * the measured run time.
  */
 static void calibrate_workload(int fd, struct workload *w)
 {
 	uint64_t n = DEVFREQ_LOOP_N;
 	int64_t start, ns;
+
+	write_stream(w, n);
+	submit_job(fd, w);
+	igt_assert_f(wait_done(fd, w->syncobjs[w->retired % DEVFREQ_JOBS],
+			       10 * SEC_NS),
+		     "warm-up job did not signal\n");
+	retire_job(fd, w);
 
 	for (;;) {
 		write_stream(w, n);
