@@ -199,8 +199,8 @@ static unsigned long long read_sysfs_u64(const char *dir, const char *file)
 /*
  * The GPU's runtime-PM control file and its saved value. While the GPU is
  * runtime-suspended its devfreq is suspended too and cur_freq freezes, so the
- * ramp-down test pins the device resumed for the observation and restores the
- * original setting afterwards.
+ * tests that watch the idle frequency pin the device resumed for the
+ * observation and restore the original setting afterwards.
  */
 static char rpm_control_path[256];
 static char rpm_control_saved[16];
@@ -275,6 +275,54 @@ static unsigned int count_opps(const char *dir)
 	free(s);
 
 	return count;
+}
+
+/* Find the lowest and highest operating points in available_frequencies. */
+static void opp_range(const char *dir, unsigned long long *min,
+		      unsigned long long *max)
+{
+	char *s = read_sysfs(dir, "available_frequencies");
+	char *tok, *save;
+
+	*min = ~0ULL;
+	*max = 0;
+	igt_assert_f(s != NULL, "available_frequencies missing\n");
+
+	for (tok = strtok_r(s, " ", &save); tok; tok = strtok_r(NULL, " ", &save)) {
+		unsigned long long f = strtoull(tok, NULL, 0);
+
+		if (f < *min)
+			*min = f;
+		if (f > *max)
+			*max = f;
+	}
+
+	free(s);
+}
+
+/*
+ * Wait for the governor to lower cur_freq on an idle, resumed GPU. Stop at the
+ * lowest OPP, or once it holds below the highest OPP for five polls.
+ */
+static unsigned long long settle_idle_freq(const char *dir,
+					   unsigned long long min,
+					   unsigned long long max)
+{
+	unsigned long long f = 0, prev = 0;
+	int stable = 0;
+
+	for (int i = 0; i < 50; i++) {
+		usleep(100000);
+		f = read_sysfs_u64(dir, "cur_freq");
+		if (f <= min)
+			break;
+		stable = f == prev ? stable + 1 : 0;
+		prev = f;
+		if (f < max && stable >= 5)
+			break;
+	}
+
+	return f;
 }
 
 static struct drm_panthor_group_create
@@ -528,7 +576,7 @@ int igt_main()
 	igt_describe("Verify cur_freq ramps up above the idle baseline under a "
 		     "sustained compute load.");
 	igt_subtest("ramp_up") {
-		unsigned long long baseline, peak;
+		unsigned long long baseline, peak, min_freq, max_freq;
 		struct workload w = {};
 		char *gov;
 
@@ -538,11 +586,17 @@ int igt_main()
 		free(gov);
 		igt_require_f(count_opps(devfreq) > 1,
 			      "need more than one OPP for the governor to scale\n");
+		igt_require_f(hold_runtime_pm_resumed(fd),
+			      "cannot pin runtime PM to observe the idle baseline\n");
 
-		/* Let the governor settle at its idle baseline. */
-		sleep(1);
-		baseline = read_sysfs_u64(devfreq, "cur_freq");
+		opp_range(devfreq, &min_freq, &max_freq);
+		baseline = settle_idle_freq(devfreq, min_freq, max_freq);
+		restore_runtime_pm(0);
 		igt_info("baseline cur_freq = %llu Hz\n", baseline);
+		igt_assert_f(baseline < max_freq,
+			     "cur_freq stayed at the highest OPP %llu Hz on an idle, resumed GPU; "
+			     "the governor sees the idle GPU as busy\n",
+			     max_freq);
 
 		submit_long_workload(fd, &w);
 
@@ -629,9 +683,11 @@ int igt_main()
 
 		/*
 		 * Drive at least one transition so the count is meaningful even
-		 * when this subtest runs in isolation.
+		 * when this subtest runs in isolation. The GPU stays resumed so
+		 * the governor also lowers the frequency after the load.
 		 */
 		if (count_opps(devfreq) > 1) {
+			hold_runtime_pm_resumed(fd);
 			submit_long_workload(fd, &w);
 			for (int i = 0; i < 20; i++) {
 				usleep(100000);
@@ -640,6 +696,7 @@ int igt_main()
 			finish_workload(fd, &w);
 			teardown_workload(fd, &w);
 			sleep(2);
+			restore_runtime_pm(0);
 		}
 
 		ts = read_sysfs(devfreq, "trans_stat");
