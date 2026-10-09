@@ -203,11 +203,22 @@ static uint32_t vm_state(int fd, uint32_t vm_id)
 	return get_state.state;
 }
 
-/* A fatal queue sets its bit in fatal_queues and the FATAL_FAULT state. */
+/*
+ * Downstream drivers report a fatal queue with this bit, and keep
+ * DRM_PANTHOR_GROUP_STATE_FATAL_FAULT for VM faults.
+ */
+#define GROUP_STATE_QUEUE_FATAL	(1u << 29)
+
+/*
+ * A fatal queue sets its bit in fatal_queues and exactly one of the
+ * FATAL_FAULT and QUEUE_FATAL states.
+ */
 static bool has_fatal_queue(const struct drm_panthor_group_get_state *get_state)
 {
-	return get_state->fatal_queues != 0 &&
-	       (get_state->state & DRM_PANTHOR_GROUP_STATE_FATAL_FAULT);
+	bool fatal_fault = get_state->state & DRM_PANTHOR_GROUP_STATE_FATAL_FAULT;
+	bool queue_fatal = get_state->state & GROUP_STATE_QUEUE_FATAL;
+
+	return get_state->fatal_queues != 0 && fatal_fault != queue_fatal;
 }
 
 /* A group that faulted or timed out fails the can-run check with EINVAL. */
