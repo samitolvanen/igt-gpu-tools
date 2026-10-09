@@ -239,14 +239,14 @@ int igt_main() {
 	igt_subtest("vm_bind") {
 		uint32_t vm_id;
 		struct panthor_bo bo;
-		uint64_t bo_size = 0x1000;
+		uint64_t bo_size = PAGE_SIZE;
 
 		igt_panthor_vm_create(fd, &vm_id, 0);
 		igt_assert_neq(vm_id, 0);
 
 		igt_panthor_bo_create(fd, &bo, bo_size, 0, 0);
 		igt_panthor_vm_bind(fd, vm_id, bo.handle,
-				    0x1000, 0x1000, DRM_PANTHOR_VM_BIND_OP_TYPE_MAP, 0);
+				    TEST_VA, PAGE_SIZE, DRM_PANTHOR_VM_BIND_OP_TYPE_MAP, 0);
 
 		igt_panthor_vm_destroy(fd, vm_id, 0);
 	}
@@ -255,16 +255,16 @@ int igt_main() {
 	igt_subtest("vm_unbind") {
 		uint32_t vm_id;
 		struct panthor_bo bo;
-		uint64_t bo_size = 0x1000;
+		uint64_t bo_size = PAGE_SIZE;
 
 		igt_panthor_vm_create(fd, &vm_id, 0);
 		igt_assert_neq(vm_id, 0);
 
 		igt_panthor_bo_create(fd, &bo, bo_size, 0, 0);
 		igt_panthor_vm_bind(fd, vm_id, bo.handle,
-				    0x1000, 0x1000, DRM_PANTHOR_VM_BIND_OP_TYPE_MAP, 0);
+				    TEST_VA, PAGE_SIZE, DRM_PANTHOR_VM_BIND_OP_TYPE_MAP, 0);
 		igt_panthor_vm_bind(fd, vm_id, 0,
-				    0x1000, 0x1000, DRM_PANTHOR_VM_BIND_OP_TYPE_UNMAP, 0);
+				    TEST_VA, PAGE_SIZE, DRM_PANTHOR_VM_BIND_OP_TYPE_UNMAP, 0);
 
 		igt_panthor_vm_destroy(fd, vm_id, 0);
 	}
@@ -273,7 +273,7 @@ int igt_main() {
 	igt_subtest("vm_unbind_invalid_address") {
 		uint32_t vm_id;
 		struct panthor_bo bo;
-		uint64_t bo_size = 0x1000;
+		uint64_t bo_size = PAGE_SIZE;
 
 		igt_panthor_vm_create(fd, &vm_id, 0);
 		igt_assert_neq(vm_id, 0);
@@ -282,7 +282,7 @@ int igt_main() {
 
 		/* This was not bound previously*/
 		igt_panthor_vm_bind(fd, vm_id, bo.handle,
-				    0x1000, 0x1000, DRM_PANTHOR_VM_BIND_OP_TYPE_UNMAP, EINVAL);
+				    TEST_VA, PAGE_SIZE, DRM_PANTHOR_VM_BIND_OP_TYPE_UNMAP, EINVAL);
 		igt_panthor_vm_destroy(fd, vm_id, 0);
 	}
 
