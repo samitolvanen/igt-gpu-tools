@@ -17,6 +17,9 @@
 /* A page-aligned GPU VA inside the user range, unlikely to collide. */
 #define TEST_VA 0x100000ULL
 
+/* The lowest non-zero 4K-aligned GPU VA. */
+#define LOW_VA 0x1000ULL
+
 /* Single-op async binds issued back-to-back by vm_bind_async_queue_depth. */
 #define QUEUE_DEPTH_OPS 64
 
@@ -283,6 +286,25 @@ int igt_main() {
 		/* This was not bound previously*/
 		igt_panthor_vm_bind(fd, vm_id, bo.handle,
 				    TEST_VA, PAGE_SIZE, DRM_PANTHOR_VM_BIND_OP_TYPE_UNMAP, EINVAL);
+		igt_panthor_vm_destroy(fd, vm_id, 0);
+	}
+
+	/* The UAPI says user VA space starts at 0x0. */
+	igt_describe("Bind and unbind one page at the lowest non-zero 4K GPU VA");
+	igt_subtest("vm_bind_low_va") {
+		uint32_t vm_id;
+		struct panthor_bo bo;
+
+		igt_panthor_vm_create(fd, &vm_id, 0);
+		igt_assert_neq(vm_id, 0);
+
+		igt_panthor_bo_create(fd, &bo, PAGE_SIZE, 0, 0);
+		igt_panthor_vm_bind(fd, vm_id, bo.handle,
+				    LOW_VA, PAGE_SIZE, DRM_PANTHOR_VM_BIND_OP_TYPE_MAP, 0);
+		igt_panthor_vm_bind(fd, vm_id, 0,
+				    LOW_VA, PAGE_SIZE, DRM_PANTHOR_VM_BIND_OP_TYPE_UNMAP, 0);
+
+		igt_panthor_free_bo(fd, &bo);
 		igt_panthor_vm_destroy(fd, vm_id, 0);
 	}
 
