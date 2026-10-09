@@ -203,6 +203,13 @@ static uint32_t vm_state(int fd, uint32_t vm_id)
 	return get_state.state;
 }
 
+/* A fatal queue sets its bit in fatal_queues and the FATAL_FAULT state. */
+static bool has_fatal_queue(const struct drm_panthor_group_get_state *get_state)
+{
+	return get_state->fatal_queues != 0 &&
+	       (get_state->state & DRM_PANTHOR_GROUP_STATE_FATAL_FAULT);
+}
+
 /* A group that faulted or timed out fails the can-run check with EINVAL. */
 static void assert_submit_rejected(int fd, uint32_t group_handle)
 {
@@ -1212,7 +1219,7 @@ int igt_main()
 
 		get_state.group_handle = group_handle;
 		do_ioctl(fd, DRM_IOCTL_PANTHOR_GROUP_GET_STATE, &get_state);
-		igt_assert(get_state.state & DRM_PANTHOR_GROUP_STATE_FATAL_FAULT);
+		igt_assert(has_fatal_queue(&get_state));
 
 		igt_panthor_group_destroy(fd, group_handle, 0);
 		igt_panthor_free_bo(fd, &bo);
@@ -1598,12 +1605,11 @@ int igt_main()
 			};
 			do_ioctl(fd, DRM_IOCTL_PANTHOR_GROUP_GET_STATE,
 				 &get_state);
-			if (get_state.state & DRM_PANTHOR_GROUP_STATE_FATAL_FAULT)
+			if (get_state.fatal_queues)
 				break;
 			usleep(10000);
 		}
-		igt_assert(get_state.state & DRM_PANTHOR_GROUP_STATE_FATAL_FAULT);
-		igt_assert_neq_u32(get_state.fatal_queues, 0);
+		igt_assert(has_fatal_queue(&get_state));
 
 		/* A command stream fault does not invalidate the VM itself. */
 		igt_assert_eq_u32(vm_state(fd, faulty_vm),
