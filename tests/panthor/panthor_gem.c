@@ -11,7 +11,7 @@
 #include "drmtest.h"
 #include "ioctl_wrappers.h"
 
-#define PAGE_SIZE 4096ULL
+#define PAGE_SIZE ((uint64_t)getpagesize())
 
 /*
  * Issue a single BO_SYNC op and return the raw ioctl result (0 on success,
