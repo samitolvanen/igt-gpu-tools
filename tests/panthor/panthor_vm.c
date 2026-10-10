@@ -14,6 +14,11 @@
 
 #define PAGE_SIZE ((uint64_t)getpagesize())
 
+#ifndef offsetofend
+#define offsetofend(type, member) \
+	(offsetof(type, member) + sizeof(((type *)NULL)->member))
+#endif
+
 /* A page-aligned GPU VA inside the user range, unlikely to collide. */
 #define TEST_VA 0x100000ULL
 
@@ -1001,7 +1006,7 @@ int igt_main() {
 		igt_assert_neq(vm_id, 0);
 		igt_panthor_bo_create(fd, &bo, PAGE_SIZE, 0, 0);
 
-		/* stride < sizeof(op) is rejected with EINVAL. */
+		/* stride < offsetofend(op, syncs) is rejected with EINVAL. */
 		{
 			struct drm_panthor_vm_bind_op op = {
 				.flags = DRM_PANTHOR_VM_BIND_OP_TYPE_MAP,
@@ -1013,7 +1018,7 @@ int igt_main() {
 				.vm_id = vm_id,
 				.ops = {
 					.count = 1,
-					.stride = sizeof(op) - 8,
+					.stride = offsetofend(struct drm_panthor_vm_bind_op, syncs) - 8,
 					.array = to_user_pointer(&op),
 				},
 			};
@@ -1049,11 +1054,14 @@ int igt_main() {
 					    DRM_PANTHOR_VM_BIND_OP_TYPE_UNMAP, 0);
 		}
 
-		/* stride > sizeof(op) with a nonzero tail is rejected with E2BIG. */
+		/*
+		 * A 256-byte stride with a non-zero trailing byte past the
+		 * kernel struct is rejected with E2BIG.
+		 */
 		{
 			struct {
 				struct drm_panthor_vm_bind_op op;
-				uint8_t tail[16];
+				uint8_t tail[256 - sizeof(struct drm_panthor_vm_bind_op)];
 			} padded = {
 				.op = {
 					.flags = DRM_PANTHOR_VM_BIND_OP_TYPE_MAP,
@@ -1061,7 +1069,9 @@ int igt_main() {
 					.va = TEST_VA,
 					.size = PAGE_SIZE,
 				},
-				.tail = { 1 },
+				.tail = {
+					[sizeof(padded.tail) - 1] = 1,
+				},
 			};
 			struct drm_panthor_vm_bind bind = {
 				.vm_id = vm_id,

@@ -13,6 +13,11 @@
 
 #define PAGE_SIZE ((uint64_t)getpagesize())
 
+#ifndef offsetofend
+#define offsetofend(type, member) \
+	(offsetof(type, member) + sizeof(((type *)NULL)->member))
+#endif
+
 /*
  * Issue a single BO_SYNC op and return the raw ioctl result (0 on success,
  * -1 on failure with errno set).
@@ -27,28 +32,19 @@ static int do_bo_sync_op(int fd, struct drm_panthor_bo_sync_op *op)
 }
 
 /*
- * Probe whether the running driver implements DRM_PANTHOR_BO_SYNC. A FLUSH on
- * a freshly-created (write-combined) BO is a no-op and must succeed on a driver
- * that supports the ioctl; a driver without it fails the ioctl (e.g. ENOTTY).
- * Returns true when BO_SYNC is supported.
+ * Probe whether the running driver implements DRM_PANTHOR_BO_SYNC. An empty
+ * op array is a no-op and must succeed on a driver that supports the ioctl;
+ * a driver without it fails the ioctl (e.g. ENOTTY).
  */
 static bool has_bo_sync(int fd)
 {
-	struct panthor_bo bo;
-	struct drm_panthor_bo_sync_op op;
-	bool supported;
-
-	igt_panthor_bo_create(fd, &bo, PAGE_SIZE, 0, 0);
-
-	op = (struct drm_panthor_bo_sync_op){
-		.handle = bo.handle,
-		.type = DRM_PANTHOR_BO_SYNC_CPU_CACHE_FLUSH,
-		.size = PAGE_SIZE,
+	struct drm_panthor_bo_sync sync = {
+		.ops = {
+			.stride = sizeof(struct drm_panthor_bo_sync_op),
+		},
 	};
-	supported = do_bo_sync_op(fd, &op) == 0;
 
-	igt_panthor_free_bo(fd, &bo);
-	return supported;
+	return igt_ioctl(fd, DRM_IOCTL_PANTHOR_BO_SYNC, &sync) == 0;
 }
 
 /*
@@ -290,7 +286,7 @@ int igt_main() {
 			igt_assert_eq(do_bo_sync_op(fd, &op), -1);
 		}
 
-		/* stride < sizeof(op) is rejected with EINVAL. */
+		/* stride < offsetofend(op, size) is rejected with EINVAL. */
 		{
 			struct drm_panthor_bo_sync_op op = {
 				.handle = bo.handle,
@@ -300,7 +296,7 @@ int igt_main() {
 			struct drm_panthor_bo_sync sync = {
 				.ops = {
 					.count = 1,
-					.stride = sizeof(op) - 4,
+					.stride = offsetofend(struct drm_panthor_bo_sync_op, size) - 4,
 					.array = to_user_pointer(&op),
 				},
 			};
@@ -330,18 +326,23 @@ int igt_main() {
 			do_ioctl(fd, DRM_IOCTL_PANTHOR_BO_SYNC, &sync);
 		}
 
-		/* stride > sizeof(op) with a nonzero tail is rejected with E2BIG. */
+		/*
+		 * A 256-byte stride with a non-zero trailing byte past the
+		 * kernel struct is rejected with E2BIG.
+		 */
 		{
 			struct {
 				struct drm_panthor_bo_sync_op op;
-				uint8_t tail[16];
+				uint8_t tail[256 - sizeof(struct drm_panthor_bo_sync_op)];
 			} padded = {
 				.op = {
 					.handle = bo.handle,
 					.type = DRM_PANTHOR_BO_SYNC_CPU_CACHE_FLUSH,
 					.size = PAGE_SIZE,
 				},
-				.tail = { 1 },
+				.tail = {
+					[sizeof(padded.tail) - 1] = 1,
+				},
 			};
 			struct drm_panthor_bo_sync sync = {
 				.ops = {
