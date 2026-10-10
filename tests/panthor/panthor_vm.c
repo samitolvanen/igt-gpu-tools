@@ -20,6 +20,12 @@
 /* The lowest non-zero 4K-aligned GPU VA. */
 #define LOW_VA 0x1000ULL
 
+/*
+ * HW_ISSUE_4275983: arch 14.8 and 15.x GPUs must not map GPU VA below 64K.
+ * A driver that applies the erratum rejects such a bind with EINVAL.
+ */
+#define ISSUE_4275983_VA_FLOOR ((uint64_t)SZ_64K)
+
 /* Single-op async binds issued back-to-back by vm_bind_async_queue_depth. */
 #define QUEUE_DEPTH_OPS 64
 
@@ -33,6 +39,19 @@ static int64_t abs_timeout(int64_t rel_ns)
 	igt_assert_eq(clock_gettime(CLOCK_MONOTONIC, &ts), 0);
 
 	return (int64_t)ts.tv_sec * NSEC_PER_SEC + ts.tv_nsec + rel_ns;
+}
+
+static bool has_issue_4275983(int fd)
+{
+	struct drm_panthor_gpu_info gpu_info = {};
+	uint32_t major, minor;
+
+	igt_panthor_query(fd, DRM_PANTHOR_DEV_QUERY_GPU_INFO,
+			  &gpu_info, sizeof(gpu_info), 0);
+	major = DRM_PANTHOR_ARCH_MAJOR(gpu_info.gpu_id);
+	minor = DRM_PANTHOR_ARCH_MINOR(gpu_info.gpu_id);
+
+	return (major == 14 && minor == 8) || major == 15;
 }
 
 static bool wait_done(int fd, uint32_t syncobj, int64_t rel_ns)
@@ -290,8 +309,14 @@ int igt_main() {
 	}
 
 	/* The UAPI says user VA space starts at 0x0. */
-	igt_describe("Bind and unbind one page at the lowest non-zero 4K GPU VA");
+	igt_describe("Bind and unbind one page at the lowest mappable non-zero GPU VA");
 	igt_subtest("vm_bind_low_va") {
+		struct drm_panthor_vm_bind_op op = {
+			.flags = DRM_PANTHOR_VM_BIND_OP_TYPE_MAP,
+			.va = LOW_VA,
+			.size = PAGE_SIZE,
+		};
+		uint64_t va = LOW_VA;
 		uint32_t vm_id;
 		struct panthor_bo bo;
 
@@ -299,10 +324,24 @@ int igt_main() {
 		igt_assert_neq(vm_id, 0);
 
 		igt_panthor_bo_create(fd, &bo, PAGE_SIZE, 0, 0);
-		igt_panthor_vm_bind(fd, vm_id, bo.handle,
-				    LOW_VA, PAGE_SIZE, DRM_PANTHOR_VM_BIND_OP_TYPE_MAP, 0);
+		op.bo_handle = bo.handle;
+		if (has_issue_4275983(fd)) {
+			/*
+			 * IGT cannot tell whether the driver applies the erratum,
+			 * so accept either policy and check the one it chose.
+			 */
+			if (do_sync_bind_op(fd, vm_id, &op)) {
+				igt_assert_eq(errno, EINVAL);
+				va = ISSUE_4275983_VA_FLOOR;
+				igt_panthor_vm_bind(fd, vm_id, bo.handle, va, PAGE_SIZE,
+						    DRM_PANTHOR_VM_BIND_OP_TYPE_MAP, 0);
+			}
+		} else {
+			igt_panthor_vm_bind(fd, vm_id, bo.handle, va, PAGE_SIZE,
+					    DRM_PANTHOR_VM_BIND_OP_TYPE_MAP, 0);
+		}
 		igt_panthor_vm_bind(fd, vm_id, 0,
-				    LOW_VA, PAGE_SIZE, DRM_PANTHOR_VM_BIND_OP_TYPE_UNMAP, 0);
+				    va, PAGE_SIZE, DRM_PANTHOR_VM_BIND_OP_TYPE_UNMAP, 0);
 
 		igt_panthor_free_bo(fd, &bo);
 		igt_panthor_vm_destroy(fd, vm_id, 0);
